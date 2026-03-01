@@ -8,6 +8,7 @@ logs/
 # Agent runtime state (local only)
 memory/
 sessions/
+proposals/
 
 # Local skills sandbox
 skills_local/

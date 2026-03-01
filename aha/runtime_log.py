@@ -18,6 +18,16 @@ _TOOL = contextvars.ContextVar[str]("aha_log_tool", default="-")
 
 def redact_text(text: str) -> str:
     redacted = re.sub(r"sk-[A-Za-z0-9]{16,}", "[REDACTED_API_KEY]", text)
+    redacted = re.sub(r"gh[pousr]_[A-Za-z0-9]{20,}", "[REDACTED_GITHUB_TOKEN]", redacted)
+    redacted = re.sub(r"AKIA[0-9A-Z]{16}", "[REDACTED_AWS_ACCESS_KEY]", redacted)
+    redacted = re.sub(r"(?i)aws_secret_access_key\s*[:=]\s*[A-Za-z0-9/+=]{20,}", "aws_secret_access_key=[REDACTED]", redacted)
+    redacted = re.sub(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b", "[REDACTED_JWT]", redacted)
+    redacted = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----", "[REDACTED_PRIVATE_KEY]", redacted)
+    redacted = re.sub(
+        r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\\s\"']+",
+        "[REDACTED_DB_CONN]",
+        redacted,
+    )
     redacted = re.sub(r"(?i)bearer\s+[A-Za-z0-9._\-]+", "Bearer [REDACTED]", redacted)
     redacted = re.sub(r"(?i)(api[_-]?key|token|secret)\s*[:=]\s*[^\s]+", r"\1=[REDACTED]", redacted)
     return redacted

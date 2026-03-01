@@ -135,11 +135,13 @@ class LiteLLMProvider(LLMProvider):
             tool_calls_count=len(tool_calls),
             content_len=len(message_content),
         )
+        usage = self._extract_usage(response)
 
         return LLMResponse(
             content=message_content,
             tool_calls=tool_calls,
             raw_message=raw_message,
+            usage=usage,
         )
 
     def _resolve_api_key(self) -> str | None:
@@ -197,3 +199,44 @@ class LiteLLMProvider(LLMProvider):
         if len(value) < 20:
             return False
         return any(ch.isdigit() for ch in value) and any(ch.isalpha() for ch in value)
+
+    @staticmethod
+    def _extract_usage(response: Any) -> dict[str, Any]:
+        usage = getattr(response, "usage", None)
+        if usage is None and isinstance(response, dict):
+            usage = response.get("usage")
+        if usage is None:
+            return {}
+
+        def _field(source: Any, key: str) -> Any:
+            if isinstance(source, dict):
+                return source.get(key)
+            return getattr(source, key, None)
+
+        prompt_tokens = _field(usage, "prompt_tokens")
+        completion_tokens = _field(usage, "completion_tokens")
+        total_tokens = _field(usage, "total_tokens")
+        cost_estimate = _field(usage, "cost") or _field(usage, "cost_estimate")
+        try:
+            prompt_tokens = int(prompt_tokens or 0)
+        except (TypeError, ValueError):
+            prompt_tokens = 0
+        try:
+            completion_tokens = int(completion_tokens or 0)
+        except (TypeError, ValueError):
+            completion_tokens = 0
+        try:
+            total_tokens = int(total_tokens or 0)
+        except (TypeError, ValueError):
+            total_tokens = 0
+        try:
+            cost_estimate = float(cost_estimate or 0.0)
+        except (TypeError, ValueError):
+            cost_estimate = 0.0
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cost_estimate": cost_estimate,
+        }

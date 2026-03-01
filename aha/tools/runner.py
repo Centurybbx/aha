@@ -12,15 +12,30 @@ from aha.tools.policy import ToolPolicy
 from aha.tools.registry import ToolRegistry
 
 ConfirmFn = Callable[[str], Awaitable[bool]]
+TraceSink = Callable[[dict[str, Any]], None]
 
 
 class ToolRunner:
-    def __init__(self, registry: ToolRegistry, policy: ToolPolicy, logger: logging.Logger | None = None):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        policy: ToolPolicy,
+        logger: logging.Logger | None = None,
+        trace_sink: TraceSink | None = None,
+    ):
         self.registry = registry
         self.policy = policy
         self.logger = logger or logging.getLogger("aha.tools.runner")
+        self.trace_sink = trace_sink
 
-    async def run(self, tool_name: str, args: dict, session_state: RuntimeSessionState, confirm: ConfirmFn) -> ToolResult:
+    async def run(
+        self,
+        tool_name: str,
+        args: dict,
+        session_state: RuntimeSessionState,
+        confirm: ConfirmFn,
+        trace_context: dict[str, Any] | None = None,
+    ) -> ToolResult:
         decision = self.policy.precheck(tool_name, args, session_state=session_state)
         log_event(
             self.logger,
@@ -34,6 +49,12 @@ class ToolRunner:
             **self._summarize_args(tool_name, args),
         )
         if not decision.allowed:
+            self._emit_trace(
+                event_type="guardrail_tripwire",
+                trace_context=trace_context,
+                tool=tool_name,
+                reason=decision.reason,
+            )
             log_event(
                 self.logger,
                 "tool_precheck_blocked",
@@ -45,6 +66,12 @@ class ToolRunner:
 
         temporary_grants: list[str] = []
         if decision.requires_confirmation:
+            self._emit_trace(
+                event_type="consent_request",
+                trace_context=trace_context,
+                tool=tool_name,
+                reason=decision.reason,
+            )
             log_event(
                 self.logger,
                 "tool_confirm_prompted",
@@ -54,8 +81,20 @@ class ToolRunner:
             )
             approved = await confirm(decision.plan or f"{tool_name}({args})")
             if not approved:
+                self._emit_trace(
+                    event_type="consent_deny",
+                    trace_context=trace_context,
+                    tool=tool_name,
+                    reason="user_denied",
+                )
                 log_event(self.logger, "tool_confirm_denied", level=logging.INFO, tool_name=tool_name)
                 return ToolResult(ok=False, data="user rejected action", warnings=["user_rejected"])
+            self._emit_trace(
+                event_type="consent_grant",
+                trace_context=trace_context,
+                tool=tool_name,
+                reason="user_approved",
+            )
             log_event(self.logger, "tool_confirm_approved", level=logging.INFO, tool_name=tool_name)
             if decision.temporary_capability:
                 session_state.capabilities.add(decision.temporary_capability)
@@ -68,13 +107,16 @@ class ToolRunner:
             result = await tool.run(args)
             result.data = self.policy.postprocess(result.data or "")
             result.output = result.data
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            result.meta = dict(result.meta or {})
+            result.meta["duration_ms"] = duration_ms
             log_event(
                 self.logger,
                 "tool_run_end",
                 level=logging.INFO,
                 tool_name=tool_name,
                 ok=result.ok,
-                duration_ms=int((time.perf_counter() - started) * 1000),
+                duration_ms=duration_ms,
                 warnings_count=len(result.warnings),
                 redactions_count=len(result.redactions),
                 **self._safe_meta(result.meta),
@@ -95,10 +137,25 @@ class ToolRunner:
                 ok=False,
                 data=f"Tool error ({type(exc).__name__}): {exc}",
                 warnings=["tool_exception"],
+                meta={"duration_ms": duration_ms},
             )
         finally:
             for capability in temporary_grants:
                 session_state.capabilities.discard(capability)
+
+    def _emit_trace(
+        self,
+        event_type: str,
+        trace_context: dict[str, Any] | None,
+        **fields: Any,
+    ) -> None:
+        if self.trace_sink is None:
+            return
+        payload: dict[str, Any] = {"event": event_type, "event_type": event_type}
+        if trace_context:
+            payload.update({key: value for key, value in trace_context.items() if value is not None})
+        payload.update({key: value for key, value in fields.items() if value is not None})
+        self.trace_sink(payload)
 
     @staticmethod
     def _safe_meta(meta: dict[str, Any]) -> dict[str, str]:

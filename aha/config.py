@@ -32,6 +32,16 @@ class AhaConfig(BaseModel):
     runtime_log_max_bytes: int = 2_000_000
     runtime_log_backups: int = 5
     runtime_log_mode: str = "prod"
+    evolution_enabled: bool = False
+    evolution_schedule: str = "daily"  # daily | weekly | custom
+    evolution_custom_interval_minutes: int = 1440
+    evolution_skill_name: str = "planner"
+    evolution_llm_judge: bool = False
+    evolution_latency_regression_pct: float = 20.0
+    evolution_max_examples: int = 0
+    evolution_run_on_startup: bool = True
+    evolution_dataset_overrides: dict[str, str] = Field(default_factory=dict)
+    evolution_baseline_file: str | None = None
 
     workspace_dir: Path = Field(default_factory=Path.cwd)
     sessions_dir: Path = Field(default=Path("sessions"))
@@ -66,6 +76,37 @@ class AhaConfig(BaseModel):
     def resolved_runtime_log_path(self) -> Path:
         filename = "aha.debug.log" if self.runtime_log_mode == "debug" else "aha.log"
         return self.resolved_runtime_log_dir() / filename
+
+    def resolved_evolution_interval_seconds(self) -> int:
+        schedule = str(self.evolution_schedule).strip().lower()
+        if schedule == "weekly":
+            return 7 * 24 * 60 * 60
+        if schedule == "custom":
+            minutes = max(1, int(self.evolution_custom_interval_minutes))
+            return minutes * 60
+        return 24 * 60 * 60
+
+    def resolved_evolution_dataset_overrides(self) -> dict[str, Path]:
+        resolved: dict[str, Path] = {}
+        for name, raw_path in self.evolution_dataset_overrides.items():
+            dataset_name = str(name).strip()
+            path_text = str(raw_path).strip()
+            if not dataset_name or not path_text:
+                continue
+            path = Path(path_text)
+            if not path.is_absolute():
+                path = (self.resolved_workspace() / path).resolve()
+            resolved[dataset_name] = path
+        return resolved
+
+    def resolved_evolution_baseline_file(self) -> Path | None:
+        value = str(self.evolution_baseline_file or "").strip()
+        if not value:
+            return None
+        path = Path(value)
+        if not path.is_absolute():
+            path = (self.resolved_workspace() / path).resolve()
+        return path
 
     def ensure_dirs(self) -> None:
         self.resolved_sessions_dir().mkdir(parents=True, exist_ok=True)

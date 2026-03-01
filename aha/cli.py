@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -17,6 +21,24 @@ from aha.config import AhaConfig, load_config
 from aha.core.context import ContextWeaver
 from aha.core.loop import AgentLoop
 from aha.core.session import RuntimeSessionState, Session, SessionStore
+from aha.evolution_scheduler import EvolutionScheduler
+from aha.evals import (
+    build_fingerprint,
+    evaluate_regression_gate,
+    load_benchmark_tasks,
+    normalize_baseline_aggregate,
+    run_offline_eval,
+)
+from aha.evolve import (
+    append_proposal_audit,
+    build_failure_reports,
+    create_skill_patch_proposal,
+    deploy_skill_patch,
+    list_proposals,
+    load_proposal,
+    rollback_skill,
+    save_proposal,
+)
 from aha.providers.base import LLMProvider
 from aha.providers.litellm_provider import LiteLLMProvider
 from aha.providers.mock_provider import MockProvider
@@ -147,6 +169,247 @@ def _looks_like_secret(value: str) -> bool:
     return any(ch.isdigit() for ch in value) and any(ch.isalpha() for ch in value)
 
 
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _parse_dataset_file_overrides(values: list[str]) -> dict[str, Path]:
+    parsed: dict[str, Path] = {}
+    for raw in values:
+        if "=" not in raw:
+            raise ValueError(f"invalid --dataset-file value: {raw}")
+        name, value = raw.split("=", 1)
+        dataset_name = name.strip()
+        dataset_path = Path(value.strip())
+        if not dataset_name or not dataset_path:
+            raise ValueError(f"invalid --dataset-file value: {raw}")
+        parsed[dataset_name] = dataset_path
+    return parsed
+
+
+def _resolve_default_dataset_paths(workspace: Path) -> dict[str, Path]:
+    local = (workspace / "benchmarks").resolve()
+    repo = (Path(__file__).resolve().parent.parent / "benchmarks").resolve()
+
+    def _pick(name: str) -> Path:
+        candidate = local / f"{name}.json"
+        if candidate.exists():
+            return candidate
+        return repo / f"{name}.json"
+
+    return {
+        "core_regression": _pick("core"),
+        "failure_replay": _pick("failure_replay"),
+        "canary": _pick("canary"),
+    }
+
+
+def _baseline_aggregate_for_dataset(
+    baseline_payload: dict[str, Any] | None,
+    dataset_name: str,
+) -> dict[str, Any] | None:
+    if baseline_payload is None:
+        return None
+    if isinstance(baseline_payload.get("datasets"), dict):
+        dataset_row = baseline_payload["datasets"].get(dataset_name)
+        if isinstance(dataset_row, dict):
+            aggregate = dataset_row.get("aggregate")
+            if isinstance(aggregate, dict):
+                return aggregate
+    aggregate = normalize_baseline_aggregate(baseline_payload)
+    return aggregate if isinstance(aggregate, dict) else None
+
+
+def _evaluate_proposal_datasets(
+    *,
+    proposal: dict[str, Any],
+    loop: AgentLoop,
+    dataset_paths: dict[str, Path],
+    baseline_payload: dict[str, Any] | None,
+    latency_regression_pct: float,
+    max_examples: int,
+    llm_judge: bool,
+) -> dict[str, Any]:
+    required_datasets = proposal.get("eval_plan", {}).get("required_datasets", [])
+    if not isinstance(required_datasets, list) or not required_datasets:
+        required_datasets = ["core_regression"]
+    required = [str(item).strip() for item in required_datasets if str(item).strip()]
+    risk_level = str(proposal.get("risk_level", "")).strip().upper()
+    if risk_level in {"R2", "R3"}:
+        for dataset_name in ("failure_replay", "canary"):
+            if dataset_name not in required:
+                required.append(dataset_name)
+
+    missing_required = [name for name in required if name not in dataset_paths or not dataset_paths[name].exists()]
+    if missing_required:
+        raise ValueError(f"missing required datasets for validation: {', '.join(missing_required)}")
+
+    datasets_validation: dict[str, Any] = {}
+    validation_pass = True
+    min_success_rate = {
+        "core_regression": 0.8,
+        "failure_replay": 0.6,
+        "canary": 0.4,
+    }
+    for dataset_name in required:
+        dataset_path = dataset_paths[dataset_name]
+        task_rows = load_benchmark_tasks(dataset_path)
+        eval_payload = asyncio.run(
+            run_offline_eval(
+                loop=loop,
+                tasks=task_rows,
+                max_examples=max_examples if max_examples > 0 else None,
+                enable_llm_judge=llm_judge,
+            )
+        )
+        baseline_aggregate = _baseline_aggregate_for_dataset(baseline_payload, dataset_name)
+        gate_failures: list[str] = []
+        if baseline_aggregate is not None:
+            gate_failures = evaluate_regression_gate(
+                aggregate=eval_payload["aggregate"],
+                baseline_aggregate=baseline_aggregate,
+                latency_regression_pct=latency_regression_pct,
+            )
+        candidate_success = float(eval_payload["aggregate"].get("success_rate", 0.0))
+        required_success = float(min_success_rate.get(dataset_name, 0.0))
+        if candidate_success < required_success:
+            gate_failures.append(
+                f"success_rate_below_threshold: candidate={candidate_success:.4f} required={required_success:.4f}"
+            )
+
+        dataset_pass = len(gate_failures) == 0
+        validation_pass = validation_pass and dataset_pass
+        datasets_validation[dataset_name] = {
+            "tasks_file": str(dataset_path),
+            "aggregate": eval_payload["aggregate"],
+            "baseline_aggregate": baseline_aggregate,
+            "gate_failures": gate_failures,
+            "pass": dataset_pass,
+        }
+
+    candidate_content = str(proposal.get("candidate", {}).get("content", ""))
+    return {
+        "validated_at": datetime.now(timezone.utc).isoformat(),
+        "required_datasets": required,
+        "datasets": datasets_validation,
+        "aggregate": datasets_validation.get("core_regression", {}).get("aggregate", {}),
+        "candidate_content_sha256": _sha256_text(candidate_content),
+        "pass": validation_pass,
+    }
+
+
+def run_auto_evolution_cycle(
+    *,
+    config: AhaConfig,
+    config_path: Path | None,
+    runtime_logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    workspace = config.resolved_workspace()
+    logger = runtime_logger.getChild("evolution") if runtime_logger else logging.getLogger("aha.evolution")
+    memory = MemoryStore(
+        memory_file=config.resolved_memory_dir() / "MEMORY.md",
+        trace_file=config.resolved_memory_dir() / "TRACE.jsonl",
+        include_sensitive_data=config.trace_include_sensitive_data,
+        trace_max_chars=config.trace_max_chars,
+        trace_max_bytes=config.trace_max_bytes,
+    )
+    evolution_dir = config.resolved_memory_dir() / "evolution"
+    evolution_dir.mkdir(parents=True, exist_ok=True)
+
+    eval_records = memory.build_eval_records(force_redact=True)
+    failure_payload = build_failure_reports(eval_records)
+    reports_file = evolution_dir / "failure_reports.latest.json"
+    reports_file.write_text(json.dumps(failure_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    report_count = len(failure_payload.get("reports", []))
+    if report_count == 0:
+        result = {
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+            "status": "no_failures",
+            "reports": 0,
+            "failure_reports_file": str(reports_file),
+        }
+        (evolution_dir / "latest.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_event(logger, "evolution_cycle", level=logging.INFO, status="no_failures", reports=0)
+        return result
+
+    proposal = create_skill_patch_proposal(
+        workspace=workspace,
+        failures_payload=failure_payload,
+        skill_name=config.evolution_skill_name,
+    )
+    proposal_id = str(proposal.get("proposal_id"))
+    append_proposal_audit(
+        workspace=workspace,
+        proposal_id=proposal_id,
+        action="auto_propose",
+        metadata={
+            "risk_level": proposal.get("risk_level"),
+            "reports": report_count,
+            "schedule": config.evolution_schedule,
+        },
+    )
+
+    loop = _build_eval_loop_from_config(config, logger=runtime_logger)
+    dataset_paths = _resolve_default_dataset_paths(workspace)
+    dataset_paths.update(config.resolved_evolution_dataset_overrides())
+
+    baseline_payload: dict[str, Any] | None = None
+    baseline_file = config.resolved_evolution_baseline_file()
+    if baseline_file is not None and baseline_file.exists():
+        try:
+            baseline_payload = json.loads(baseline_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            baseline_payload = None
+
+    validation = _evaluate_proposal_datasets(
+        proposal=proposal,
+        loop=loop,
+        dataset_paths=dataset_paths,
+        baseline_payload=baseline_payload,
+        latency_regression_pct=float(config.evolution_latency_regression_pct),
+        max_examples=int(config.evolution_max_examples),
+        llm_judge=bool(config.evolution_llm_judge),
+    )
+    proposal_file, proposal_payload = load_proposal(workspace, proposal_id)
+    proposal_payload["validation"] = validation
+    proposal_payload["status"] = "validated" if bool(validation.get("pass")) else "validation_failed"
+    proposal_payload["auto_pipeline"] = {
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "scheduled",
+        "schedule": config.evolution_schedule,
+    }
+    save_proposal(proposal_file, proposal_payload)
+    append_proposal_audit(
+        workspace=workspace,
+        proposal_id=proposal_id,
+        action="auto_validate",
+        metadata={
+            "pass": bool(validation.get("pass")),
+            "required_datasets": validation.get("required_datasets", []),
+        },
+    )
+
+    result = {
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "status": "validated" if bool(validation.get("pass")) else "validation_failed",
+        "proposal_id": proposal_id,
+        "reports": report_count,
+        "failure_reports_file": str(reports_file),
+        "required_datasets": validation.get("required_datasets", []),
+        "validation_pass": bool(validation.get("pass")),
+    }
+    (evolution_dir / "latest.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_event(
+        logger,
+        "evolution_cycle",
+        level=logging.INFO,
+        status=result["status"],
+        proposal_id=proposal_id,
+        reports=report_count,
+    )
+    return result
+
+
 def _select_provider(config: AhaConfig, logger: logging.Logger | None = None) -> LLMProvider:
     if config.provider == "mock":
         return MockProvider()
@@ -197,7 +460,6 @@ def _build_runtime(
 
     policy = ToolPolicy(workspace=workspace, skills_local=config.resolved_skills_local_dir())
     skill_manager_tool.set_known_capabilities(set(policy.KNOWN_CAPABILITIES))
-    runner = ToolRunner(registry=registry, policy=policy, logger=runtime_logger.getChild("tools.runner"))
 
     memory = MemoryStore(
         memory_file=config.resolved_memory_dir() / "MEMORY.md",
@@ -205,6 +467,12 @@ def _build_runtime(
         include_sensitive_data=config.trace_include_sensitive_data,
         trace_max_chars=config.trace_max_chars,
         trace_max_bytes=config.trace_max_bytes,
+    )
+    runner = ToolRunner(
+        registry=registry,
+        policy=policy,
+        logger=runtime_logger.getChild("tools.runner"),
+        trace_sink=memory.append_trace,
     )
     provider = _select_provider(config, logger=runtime_logger)
     loop = AgentLoop(
@@ -221,6 +489,48 @@ def _build_runtime(
     )
     store = SessionStore(config.resolved_sessions_dir())
     return loop, store, memory, config, runtime_logger, runtime_log_path
+
+
+def _build_eval_loop_from_config(config: AhaConfig, logger: logging.Logger | None = None) -> AgentLoop:
+    workspace = config.resolved_workspace()
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(workspace))
+    registry.register(WriteFileTool(workspace, config.resolved_skills_local_dir()))
+    registry.register(ShellTool(workspace, default_timeout=config.shell_timeout_seconds))
+    registry.register(WebSearchTool())
+    registry.register(WebFetchTool())
+    skill_manager_tool = SkillManagerTool(config.resolved_skills_local_dir(), skills_dir=config.resolved_skills_dir())
+    registry.register(skill_manager_tool)
+    skill_manager_tool.set_known_tool_names(set(registry.names()))
+
+    policy = ToolPolicy(workspace=workspace, skills_local=config.resolved_skills_local_dir())
+    skill_manager_tool.set_known_capabilities(set(policy.KNOWN_CAPABILITIES))
+    memory = MemoryStore(
+        memory_file=config.resolved_memory_dir() / "MEMORY.md",
+        trace_file=config.resolved_memory_dir() / "TRACE.jsonl",
+        include_sensitive_data=config.trace_include_sensitive_data,
+        trace_max_chars=config.trace_max_chars,
+        trace_max_bytes=config.trace_max_bytes,
+    )
+    runner = ToolRunner(
+        registry=registry,
+        policy=policy,
+        logger=logger.getChild("tools.runner.eval") if logger else None,
+        trace_sink=memory.append_trace,
+    )
+    provider = _select_provider(config, logger=logger)
+    return AgentLoop(
+        provider=provider,
+        tool_runner=runner,
+        memory=memory,
+        context_weaver=ContextWeaver(token_budget=config.token_budget),
+        tool_names=registry.names(),
+        workspace=str(workspace),
+        skills_dir=str(config.resolved_skills_dir()),
+        skills_local=str(config.resolved_skills_local_dir()),
+        max_steps=config.max_steps,
+        logger=logger.getChild("loop.eval") if logger else None,
+    )
 
 
 def _endpoint_host(endpoint: str | None) -> str:
@@ -349,6 +659,34 @@ def chat(
         endpoint_host=_endpoint_host(effective_config.resolved_api_base()),
         session=current.session_id,
     )
+    evolution_scheduler: EvolutionScheduler | None = None
+    if effective_config.evolution_enabled and not prompt:
+        interval_seconds = effective_config.resolved_evolution_interval_seconds()
+        evolution_scheduler = EvolutionScheduler(
+            interval_seconds=interval_seconds,
+            run_on_startup=effective_config.evolution_run_on_startup,
+            logger=runtime_logger.getChild("evolution.scheduler"),
+            run_cycle=lambda: run_auto_evolution_cycle(
+                config=effective_config,
+                config_path=config_path,
+                runtime_logger=runtime_logger,
+            ),
+        )
+        evolution_scheduler.start()
+        console.print(
+            f"[dim]Auto evolution enabled: schedule={effective_config.evolution_schedule} "
+            f"interval={interval_seconds}s skill={effective_config.evolution_skill_name} "
+            f"(manual deploy required)[/dim]"
+        )
+        log_event(
+            runtime_logger.getChild("cli"),
+            "evolution_scheduler_start",
+            level=logging.INFO,
+            schedule=effective_config.evolution_schedule,
+            interval_seconds=interval_seconds,
+            run_on_startup=effective_config.evolution_run_on_startup,
+            skill=effective_config.evolution_skill_name,
+        )
 
     async def confirm_action(plan_text: str) -> bool:
         console.print(Panel(plan_text, title="Plan / Apply"))
@@ -420,6 +758,8 @@ def chat(
             except RuntimeError as exc:
                 console.print(f"[red]{exc}[/red]")
     finally:
+        if evolution_scheduler is not None:
+            evolution_scheduler.stop()
         runner.close()
 
 
@@ -530,3 +870,549 @@ def doctor(
         )
         console.print(f"[red]Ping failed: {exc}[/red]")
         raise typer.Exit(code=1)
+
+
+@app.command("eval-export")
+def eval_export(
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+    output: Optional[Path] = typer.Option(None, help="Dataset output JSONL path"),
+) -> None:
+    config = load_config(path=config_path)
+    memory = MemoryStore(
+        memory_file=config.resolved_memory_dir() / "MEMORY.md",
+        trace_file=config.resolved_memory_dir() / "TRACE.jsonl",
+        include_sensitive_data=config.trace_include_sensitive_data,
+        trace_max_chars=config.trace_max_chars,
+        trace_max_bytes=config.trace_max_bytes,
+    )
+    output_path = output or (config.resolved_memory_dir() / "eval.dataset.jsonl")
+    payload = memory.export_eval_dataset(output_path)
+    typer.echo(json.dumps(payload, ensure_ascii=False))
+
+
+@app.command("eval-metrics")
+def eval_metrics(
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+    output: Optional[Path] = typer.Option(None, help="Optional metrics output JSON path"),
+) -> None:
+    config = load_config(path=config_path)
+    memory = MemoryStore(
+        memory_file=config.resolved_memory_dir() / "MEMORY.md",
+        trace_file=config.resolved_memory_dir() / "TRACE.jsonl",
+        include_sensitive_data=config.trace_include_sensitive_data,
+        trace_max_chars=config.trace_max_chars,
+        trace_max_bytes=config.trace_max_bytes,
+    )
+    payload = memory.summarize_trace_metrics()
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(json.dumps(payload, ensure_ascii=False))
+
+
+@app.command("eval-run")
+def eval_run(
+    tasks: Path = typer.Option(..., help="Benchmark tasks file (.json or .jsonl)"),
+    output: Optional[Path] = typer.Option(None, help="Eval result output JSON path"),
+    baseline: Optional[Path] = typer.Option(None, help="Optional baseline eval result JSON path"),
+    latency_regression_pct: float = typer.Option(20.0, help="Allowed p95 latency regression percentage"),
+    max_examples: int = typer.Option(0, help="Maximum examples to run (0 means all)"),
+    llm_judge: bool = typer.Option(False, "--llm-judge/--no-llm-judge", help="Enable LLM-as-judge scoring when rubric exists"),
+    provider: Optional[str] = typer.Option(None, help="Provider name: mock|litellm"),
+    model: Optional[str] = typer.Option(None, help="Model name for litellm provider"),
+    api_key: Optional[str] = typer.Option(None, help="Optional API key"),
+    api_key_env: Optional[str] = typer.Option(None, help="API key env var for litellm"),
+    endpoint: Optional[str] = typer.Option(None, help="Generic endpoint/base URL for litellm"),
+    api_base: Optional[str] = typer.Option(None, help="Optional API base URL for litellm"),
+    api_version: Optional[str] = typer.Option(None, help="Optional API version for litellm"),
+    request_timeout_seconds: Optional[int] = typer.Option(None, help="LLM request timeout in seconds"),
+    temperature: Optional[float] = typer.Option(None, help="LLM temperature"),
+    max_completion_tokens: Optional[int] = typer.Option(None, help="Max completion tokens"),
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+) -> None:
+    provider_overrides = _provider_overrides(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        endpoint=endpoint,
+        api_base=api_base,
+        api_version=api_version,
+        request_timeout_seconds=request_timeout_seconds,
+        temperature=temperature,
+        max_completion_tokens=max_completion_tokens,
+    )
+    overrides = {
+        **provider_overrides,
+        "runtime_log_enabled": False,
+        "runtime_log_console": False,
+    }
+    try:
+        loop, _store, _memory, config, _runtime_logger, _runtime_log_path = _build_runtime(
+            overrides=overrides,
+            config_path=config_path,
+        )
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    try:
+        task_rows = load_benchmark_tasks(tasks)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        console.print(f"[red]failed to load tasks: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+    eval_payload = asyncio.run(
+        run_offline_eval(
+            loop=loop,
+            tasks=task_rows,
+            max_examples=max_examples if max_examples > 0 else None,
+            enable_llm_judge=llm_judge,
+        )
+    )
+    result = {
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "build_fingerprint": build_fingerprint(config),
+        "dataset": {
+            "tasks_file": str(tasks),
+            "examples_total": len(eval_payload["examples"]),
+        },
+        "aggregate": eval_payload["aggregate"],
+        "examples": eval_payload["examples"],
+        "regression_pass": True,
+        "gate_failures": [],
+    }
+
+    if baseline is not None:
+        try:
+            baseline_payload = json.loads(baseline.read_text(encoding="utf-8"))
+            baseline_aggregate = normalize_baseline_aggregate(baseline_payload)
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            console.print(f"[red]failed to read baseline: {exc}[/red]")
+            raise typer.Exit(code=1)
+        failures = evaluate_regression_gate(
+            aggregate=result["aggregate"],
+            baseline_aggregate=baseline_aggregate,
+            latency_regression_pct=latency_regression_pct,
+        )
+        result["gate_failures"] = failures
+        result["regression_pass"] = len(failures) == 0
+
+    output_path = output or (config.resolved_memory_dir() / "eval.run.result.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(json.dumps({"output_file": str(output_path), "aggregate": result["aggregate"]}, ensure_ascii=False))
+
+    if not result["regression_pass"]:
+        raise typer.Exit(code=2)
+
+
+@app.command("evolve-analyze")
+def evolve_analyze(
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+    output: Optional[Path] = typer.Option(None, help="Failure report output JSON path"),
+) -> None:
+    config = load_config(path=config_path)
+    memory = MemoryStore(
+        memory_file=config.resolved_memory_dir() / "MEMORY.md",
+        trace_file=config.resolved_memory_dir() / "TRACE.jsonl",
+        include_sensitive_data=config.trace_include_sensitive_data,
+        trace_max_chars=config.trace_max_chars,
+        trace_max_bytes=config.trace_max_bytes,
+    )
+    records = memory.build_eval_records(force_redact=True)
+    payload = build_failure_reports(records)
+    out_path = output or (config.resolved_memory_dir() / "failure_reports.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(json.dumps({"output_file": str(out_path), "reports": len(payload.get("reports", []))}, ensure_ascii=False))
+
+
+@app.command("evolve-propose")
+def evolve_propose(
+    failures: Path = typer.Option(..., help="Failure report JSON file"),
+    skill_name: str = typer.Option(..., help="Target skill name for skill_patch proposal"),
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+) -> None:
+    config = load_config(path=config_path)
+    try:
+        failures_payload = json.loads(failures.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        console.print(f"[red]failed to load failure reports: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+    try:
+        proposal = create_skill_patch_proposal(
+            workspace=config.resolved_workspace(),
+            failures_payload=failures_payload,
+            skill_name=skill_name,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    append_proposal_audit(
+        workspace=config.resolved_workspace(),
+        proposal_id=str(proposal.get("proposal_id")),
+        action="propose",
+        metadata={
+            "type": proposal.get("type"),
+            "risk_level": proposal.get("risk_level"),
+            "source_failure_ids": proposal.get("source_failure_ids", []),
+        },
+    )
+    typer.echo(json.dumps({"proposal_id": proposal["proposal_id"], "status": proposal["status"]}, ensure_ascii=False))
+
+
+@app.command("evolve-list")
+def evolve_list(config_path: Optional[Path] = typer.Option(None, help="Custom config file path")) -> None:
+    config = load_config(path=config_path)
+    payload = list_proposals(config.resolved_workspace())
+    typer.echo(json.dumps({"proposals": payload}, ensure_ascii=False))
+
+
+@app.command("evolve-show")
+def evolve_show(
+    proposal_id: str = typer.Option(..., help="Proposal id"),
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+) -> None:
+    config = load_config(path=config_path)
+    try:
+        _proposal_file, proposal = load_proposal(config.resolved_workspace(), proposal_id)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(proposal, ensure_ascii=False))
+
+
+@app.command("evolve-validate")
+def evolve_validate(
+    proposal_id: str = typer.Option(..., help="Proposal id"),
+    tasks: Optional[Path] = typer.Option(None, help="Core regression tasks file"),
+    dataset_file: list[str] = typer.Option(
+        [],
+        "--dataset-file",
+        help="Dataset override (repeat): dataset_name=/path/to/tasks.json",
+    ),
+    baseline: Optional[Path] = typer.Option(None, help="Optional baseline eval result"),
+    latency_regression_pct: float = typer.Option(20.0, help="Allowed p95 latency regression percentage"),
+    max_examples: int = typer.Option(0, help="Maximum examples to run (0 means all)"),
+    llm_judge: bool = typer.Option(False, "--llm-judge/--no-llm-judge", help="Enable LLM-as-judge scoring when rubric exists"),
+    provider: Optional[str] = typer.Option(None, help="Provider name: mock|litellm"),
+    model: Optional[str] = typer.Option(None, help="Model name for litellm provider"),
+    api_key: Optional[str] = typer.Option(None, help="Optional API key"),
+    api_key_env: Optional[str] = typer.Option(None, help="API key env var for litellm"),
+    endpoint: Optional[str] = typer.Option(None, help="Generic endpoint/base URL for litellm"),
+    api_base: Optional[str] = typer.Option(None, help="Optional API base URL for litellm"),
+    api_version: Optional[str] = typer.Option(None, help="Optional API version for litellm"),
+    request_timeout_seconds: Optional[int] = typer.Option(None, help="LLM request timeout in seconds"),
+    temperature: Optional[float] = typer.Option(None, help="LLM temperature"),
+    max_completion_tokens: Optional[int] = typer.Option(None, help="Max completion tokens"),
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+) -> None:
+    config = load_config(path=config_path)
+    try:
+        proposal_file, proposal = load_proposal(config.resolved_workspace(), proposal_id)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    provider_overrides = _provider_overrides(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        endpoint=endpoint,
+        api_base=api_base,
+        api_version=api_version,
+        request_timeout_seconds=request_timeout_seconds,
+        temperature=temperature,
+        max_completion_tokens=max_completion_tokens,
+    )
+    overrides = {
+        **provider_overrides,
+        "runtime_log_enabled": False,
+        "runtime_log_console": False,
+    }
+    try:
+        loop, _store, _memory, _effective_config, _runtime_logger, _runtime_log_path = _build_runtime(
+            overrides=overrides,
+            config_path=config_path,
+        )
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    default_dataset_paths = _resolve_default_dataset_paths(config.resolved_workspace())
+    dataset_paths: dict[str, Path] = dict(default_dataset_paths)
+    if tasks is not None:
+        dataset_paths["core_regression"] = tasks
+
+    try:
+        overrides = _parse_dataset_file_overrides(dataset_file)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    dataset_paths.update(overrides)
+
+    baseline_payload: dict[str, Any] | None = None
+    if baseline is not None:
+        try:
+            baseline_payload = json.loads(baseline.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            console.print(f"[red]failed to read baseline: {exc}[/red]")
+            raise typer.Exit(code=1)
+
+    try:
+        validation = _evaluate_proposal_datasets(
+            proposal=proposal,
+            loop=loop,
+            dataset_paths=dataset_paths,
+            baseline_payload=baseline_payload,
+            latency_regression_pct=latency_regression_pct,
+            max_examples=max_examples,
+            llm_judge=llm_judge,
+        )
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        console.print(f"[red]validation failed: {exc}[/red]")
+        raise typer.Exit(code=1)
+    proposal["validation"] = validation
+    proposal["status"] = "validated" if validation["pass"] else "validation_failed"
+    save_proposal(proposal_file, proposal)
+    append_proposal_audit(
+        workspace=config.resolved_workspace(),
+        proposal_id=proposal_id,
+        action="validate",
+        metadata={
+            "pass": validation["pass"],
+            "required_datasets": validation.get("required_datasets", []),
+            "risk_level": proposal.get("risk_level"),
+        },
+    )
+    typer.echo(json.dumps({"proposal_id": proposal_id, "status": proposal["status"]}, ensure_ascii=False))
+    if not validation["pass"]:
+        raise typer.Exit(code=2)
+
+
+def _evolve_deploy_impl(
+    *,
+    proposal_id: str,
+    confirm_r3_risk: bool,
+    confirm_r3_rollback: bool,
+    config_path: Optional[Path],
+) -> None:
+    config = load_config(path=config_path)
+    try:
+        proposal_file, proposal = load_proposal(config.resolved_workspace(), proposal_id)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    validation = proposal.get("validation") or {}
+    if not bool(validation.get("pass")):
+        console.print("[red]proposal is not validated[/red]")
+        raise typer.Exit(code=1)
+    required_datasets = proposal.get("eval_plan", {}).get("required_datasets", [])
+    if not isinstance(required_datasets, list):
+        required_datasets = []
+    if not required_datasets:
+        required_datasets = ["core_regression"]
+    dataset_rows = validation.get("datasets", {})
+    if not isinstance(dataset_rows, dict):
+        dataset_rows = {}
+    missing_datasets = [name for name in required_datasets if name not in dataset_rows]
+    failed_datasets = [name for name, row in dataset_rows.items() if isinstance(row, dict) and not bool(row.get("pass"))]
+    if missing_datasets:
+        console.print(f"[red]validation missing required datasets: {', '.join(missing_datasets)}[/red]")
+        raise typer.Exit(code=1)
+    if failed_datasets:
+        console.print(f"[red]validation failed on datasets: {', '.join(failed_datasets)}[/red]")
+        raise typer.Exit(code=1)
+
+    risk_level = str(proposal.get("risk_level", "")).strip().upper()
+    if risk_level == "R3" and not (confirm_r3_risk and confirm_r3_rollback):
+        console.print(
+            "[red]R3 deployment requires --confirm-r3-risk and --confirm-r3-rollback[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        deployed = asyncio.run(
+            deploy_skill_patch(
+                workspace=config.resolved_workspace(),
+                skills_local_dir=config.resolved_skills_local_dir(),
+                skills_dir=config.resolved_skills_dir(),
+                proposal=proposal,
+            )
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]deploy failed: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+    proposal["status"] = "deployed"
+    proposal["deployment"] = {
+        "deployed_at": datetime.now(timezone.utc).isoformat(),
+        "risk_level": risk_level,
+        "r3_double_confirmation": bool(confirm_r3_risk and confirm_r3_rollback),
+        **deployed,
+    }
+    save_proposal(proposal_file, proposal)
+    append_proposal_audit(
+        workspace=config.resolved_workspace(),
+        proposal_id=proposal_id,
+        action="deploy",
+        metadata={
+            "risk_level": risk_level,
+            "r3_double_confirmation": bool(confirm_r3_risk and confirm_r3_rollback),
+            "deployment": proposal.get("deployment", {}),
+        },
+    )
+    typer.echo(json.dumps({"proposal_id": proposal_id, "status": proposal["status"]}, ensure_ascii=False))
+
+
+@app.command("evolve-deploy")
+def evolve_deploy(
+    proposal_id: str = typer.Option(..., help="Proposal id"),
+    confirm_r3_risk: bool = typer.Option(
+        False,
+        "--confirm-r3-risk",
+        help="R3 only: confirm you reviewed the policy risk impact",
+    ),
+    confirm_r3_rollback: bool = typer.Option(
+        False,
+        "--confirm-r3-rollback",
+        help="R3 only: confirm rollback plan is verified",
+    ),
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+) -> None:
+    _evolve_deploy_impl(
+        proposal_id=proposal_id,
+        confirm_r3_risk=confirm_r3_risk,
+        confirm_r3_rollback=confirm_r3_rollback,
+        config_path=config_path,
+    )
+
+
+@app.command("evolve-reject")
+def evolve_reject(
+    proposal_id: str = typer.Option(..., help="Proposal id"),
+    reason: str = typer.Option("rejected_by_user", help="Reject reason"),
+    actor: str = typer.Option("cli_user", help="Actor id for audit trail"),
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+) -> None:
+    config = load_config(path=config_path)
+    try:
+        proposal_file, proposal = load_proposal(config.resolved_workspace(), proposal_id)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    proposal["status"] = "rejected"
+    proposal["rejected_at"] = datetime.now(timezone.utc).isoformat()
+    proposal["reject_reason"] = reason
+    proposal["rejection"] = {
+        "rejected_at": proposal["rejected_at"],
+        "reason": reason,
+        "actor": actor,
+        "risk_level": proposal.get("risk_level"),
+        "type": proposal.get("type"),
+        "validation_passed": bool((proposal.get("validation") or {}).get("pass")),
+    }
+    save_proposal(proposal_file, proposal)
+    append_proposal_audit(
+        workspace=config.resolved_workspace(),
+        proposal_id=proposal_id,
+        action="reject",
+        metadata=proposal["rejection"],
+    )
+    typer.echo(json.dumps({"proposal_id": proposal_id, "status": proposal["status"]}, ensure_ascii=False))
+
+
+@app.command("evolve-monitor")
+def evolve_monitor(
+    baseline: Optional[Path] = typer.Option(None, help="Optional baseline metrics JSON"),
+    output: Optional[Path] = typer.Option(None, help="Optional monitor report output"),
+    watch: bool = typer.Option(False, "--watch/--once", help="Continuously monitor metrics"),
+    interval_seconds: int = typer.Option(60, help="Watch interval in seconds"),
+    max_iterations: int = typer.Option(0, help="Watch mode only; 0 means run forever"),
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+) -> None:
+    config = load_config(path=config_path)
+    memory = MemoryStore(
+        memory_file=config.resolved_memory_dir() / "MEMORY.md",
+        trace_file=config.resolved_memory_dir() / "TRACE.jsonl",
+        include_sensitive_data=config.trace_include_sensitive_data,
+        trace_max_chars=config.trace_max_chars,
+        trace_max_bytes=config.trace_max_bytes,
+    )
+    alerts: list[str] = []
+    baseline_metrics: dict[str, Any] | None = None
+    if baseline is not None:
+        try:
+            baseline_metrics = json.loads(baseline.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            console.print(f"[red]failed to read baseline metrics: {exc}[/red]")
+            raise typer.Exit(code=1)
+
+    history: list[dict[str, Any]] = []
+    iterations = 0
+    while True:
+        iterations += 1
+        current = memory.summarize_trace_metrics()
+        iter_alerts: list[str] = []
+        if baseline_metrics is not None:
+            if float(current.get("success_rate", 0.0)) < float(baseline_metrics.get("success_rate", 0.0)):
+                iter_alerts.append("success_rate_drop")
+            if float(current.get("policy_block_rate", 0.0)) > float(baseline_metrics.get("policy_block_rate", 0.0)):
+                iter_alerts.append("policy_block_rate_increase")
+            if int(current.get("tool_error_count", 0)) > int(baseline_metrics.get("tool_error_count", 0)):
+                iter_alerts.append("tool_error_spike")
+        alerts.extend(iter_alerts)
+        history.append(
+            {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "current": current,
+                "alerts": iter_alerts,
+            }
+        )
+        if not watch:
+            break
+        if max_iterations > 0 and iterations >= max_iterations:
+            break
+        time.sleep(max(0, int(interval_seconds)))
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "current": history[-1]["current"] if history else {},
+        "baseline": baseline_metrics,
+        "alerts": sorted(set(alerts)),
+        "rollback_recommended": len(set(alerts)) > 0,
+        "iterations_run": iterations,
+        "history": history if watch else [],
+    }
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(json.dumps(report, ensure_ascii=False))
+    if report["alerts"]:
+        raise typer.Exit(code=2)
+
+
+@app.command("evolve-rollback")
+def evolve_rollback(
+    skill_name: str = typer.Option(..., help="Skill name"),
+    target: Optional[str] = typer.Option(None, help="Optional snapshot target"),
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+) -> None:
+    config = load_config(path=config_path)
+    try:
+        payload = asyncio.run(
+            rollback_skill(
+                skills_local_dir=config.resolved_skills_local_dir(),
+                skills_dir=config.resolved_skills_dir(),
+                skill_name=skill_name,
+                target=target,
+            )
+        )
+    except RuntimeError as exc:
+        console.print(f"[red]rollback failed: {exc}[/red]")
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(payload, ensure_ascii=False))

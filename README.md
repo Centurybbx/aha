@@ -36,6 +36,39 @@ Start chat:
 uv run aha
 ```
 
+### Auto Evolution (Scheduled Analyze + Manual Deploy)
+
+You can configure scheduled self-improvement in `~/.aha/config.json`.
+When `aha chat` starts, it will run periodic cycles:
+`analyze -> propose -> validate` and stop before deploy (manual `evolve-deploy` is still required).
+
+```json
+{
+  "provider": "litellm",
+  "model": "openai/your-model-name",
+  "api_key_env": "AHA_LLM_API_KEY",
+  "evolution_enabled": true,
+  "evolution_schedule": "daily",
+  "evolution_skill_name": "planner",
+  "evolution_run_on_startup": true
+}
+```
+
+Schedule options:
+- `evolution_schedule: \"daily\"` (every 24 hours)
+- `evolution_schedule: \"weekly\"` (every 7 days)
+- `evolution_schedule: \"custom\"` + `evolution_custom_interval_minutes`
+
+Optional knobs:
+- `evolution_dataset_overrides`: map dataset name to file path
+- `evolution_baseline_file`: baseline result JSON path
+- `evolution_llm_judge`: enable LLM-as-judge during scheduled validate
+- `evolution_max_examples`: cap examples per dataset
+
+Cycle outputs are written to:
+- `memory/evolution/failure_reports.latest.json`
+- `memory/evolution/latest.json`
+
 ## Runtime Logs
 
 Runtime logs are separate from `memory/TRACE.jsonl`:
@@ -84,6 +117,99 @@ tail -n 200 logs/aha.log
 tail -f logs/aha.debug.log
 ```
 
+## Evals Commands
+
+Export a redacted eval dataset from `memory/TRACE.jsonl`:
+
+```bash
+uv run aha eval-export --output memory/eval.dataset.jsonl
+```
+
+Summarize trace metrics:
+
+```bash
+uv run aha eval-metrics --output memory/eval.metrics.json
+```
+
+Run offline eval tasks (`.json` or `.jsonl`) and write experiment result:
+
+```bash
+uv run aha eval-run --provider mock --tasks ./benchmarks/core.json --output memory/eval.run.result.json
+```
+
+Enable optional LLM-as-Judge scoring (for samples with `rubric`):
+
+```bash
+uv run aha eval-run --provider litellm --tasks ./benchmarks/core.json --llm-judge
+```
+
+Run with regression gate against a baseline result:
+
+```bash
+uv run aha eval-run --provider mock --tasks ./benchmarks/core.json --baseline memory/eval.baseline.json
+```
+
+## Evolution Loop Commands
+
+Generate failure reports from trace/eval records:
+
+```bash
+uv run aha evolve-analyze --output memory/failure_reports.json
+```
+
+Generate a `skill_patch` proposal:
+
+```bash
+uv run aha evolve-propose --failures memory/failure_reports.json --skill-name planner
+```
+
+Validate a proposal on eval tasks:
+
+```bash
+uv run aha evolve-validate --proposal-id <id> --tasks benchmarks/core.json --provider mock
+```
+
+Override additional validation datasets (repeat `--dataset-file`):
+
+```bash
+uv run aha evolve-validate \
+  --proposal-id <id> \
+  --tasks benchmarks/core.json \
+  --dataset-file failure_replay=benchmarks/failure_replay.json \
+  --dataset-file canary=benchmarks/canary.json \
+  --provider mock
+```
+
+Deploy a validated proposal:
+
+```bash
+uv run aha evolve-deploy --proposal-id <id>
+```
+
+R3 proposals require double confirmation:
+
+```bash
+uv run aha evolve-deploy --proposal-id <id> --confirm-r3-risk --confirm-r3-rollback
+```
+
+Monitor online metrics and trigger alerts:
+
+```bash
+uv run aha evolve-monitor --baseline memory/eval.metrics.baseline.json
+```
+
+Continuous monitor loop:
+
+```bash
+uv run aha evolve-monitor --watch --interval-seconds 60 --max-iterations 10
+```
+
+Rollback a deployed skill change:
+
+```bash
+uv run aha evolve-rollback --skill-name planner
+```
+
 ## Repo Hygiene
 
 This repo keeps only source code and tests in Git by default. The following are local runtime artifacts and are ignored:
@@ -113,6 +239,10 @@ OpenRouter example:
 - `ToolResult` now uses `data/redactions` as primary fields.
 - Compatibility fields `output/meta` are still returned for MVP stability.
 - `/new` slash command is supported inside `aha chat`.
+- Benchmark datasets:
+  - `benchmarks/core.json` (core regression)
+  - `benchmarks/failure_replay.json` (known failures replay)
+  - `benchmarks/canary.json` (exploratory/canary coverage)
 - `skill_manager` supports governance actions:
   - `generate`, `check`, `diff`, `enable`, `disable`, `rollback`, `list`
   - compatibility aliases: `install -> generate`, `remove` (legacy delete)

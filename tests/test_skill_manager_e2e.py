@@ -10,7 +10,7 @@ def _json(data: str) -> dict:
     return json.loads(data)
 
 
-def test_phase3_e2e_warn_enable_diff_and_rollback(tmp_path):
+def test_skill_e2e_warn_enable_diff_and_rollback(tmp_path):
     skills_local = tmp_path / "skills_local"
     tool = SkillManagerTool(skills_local)
     generated = asyncio.run(
@@ -83,7 +83,7 @@ token should be handled carefully
     assert rolled.ok
 
 
-def test_phase3_e2e_error_blocks_enable(tmp_path):
+def test_skill_e2e_error_blocks_enable(tmp_path):
     skills_local = tmp_path / "skills_local"
     tool = SkillManagerTool(skills_local)
     generated = asyncio.run(
