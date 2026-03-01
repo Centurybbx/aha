@@ -113,7 +113,15 @@ OpenRouter example:
 - `ToolResult` now uses `data/redactions` as primary fields.
 - Compatibility fields `output/meta` are still returned for MVP stability.
 - `/new` slash command is supported inside `aha chat`.
-- `/dry-run` was explicitly deferred and is not implemented in this MVP.
+- `skill_manager` supports governance actions:
+  - `generate`, `check`, `diff`, `enable`, `disable`, `rollback`, `list`
+  - compatibility aliases: `install -> generate`, `remove` (legacy delete)
+  - `enable` requires a fresh `check` result (`PASS`/`WARN`) for current quarantine content
+  - `check` returns normalized manifest + structured lint findings (`ERROR/WARN/INFO`) and risk flags
+  - `diff`/`enable` expose unified diff + risk delta (`added/removed risk flags`)
+  - `lock.json` entries include `pin` format: `name@version#hash`
+  - runtime skill constraints are enforced when tool calls include `_source_skill` (and side-effecting calls are blocked if attribution is missing while active skills exist)
+  - skill mutations are rate-limited and check records are integrity-signed
 
 ## Without uv (fallback)
 

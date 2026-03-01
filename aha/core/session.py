@@ -16,12 +16,14 @@ class Session:
     session_id: str
     created_at: str
     messages: list[dict] = field(default_factory=list)
+    active_skills: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "id": self.session_id,
             "created_at": self.created_at,
             "messages": self.messages,
+            "active_skills": self.active_skills,
         }
 
     @classmethod
@@ -30,12 +32,14 @@ class Session:
             session_id=payload["id"],
             created_at=payload.get("created_at", _iso_now()),
             messages=payload.get("messages", []),
+            active_skills=payload.get("active_skills", []),
         )
 
 
 @dataclass
 class RuntimeSessionState:
     capabilities: set[str] = field(default_factory=lambda: {"fs.read", "web.read"})
+    active_skills: dict[str, dict] = field(default_factory=dict)
     dry_run: bool = False
 
 

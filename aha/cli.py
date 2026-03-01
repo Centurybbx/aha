@@ -191,9 +191,12 @@ def _build_runtime(
     registry.register(ShellTool(workspace, default_timeout=config.shell_timeout_seconds))
     registry.register(WebSearchTool())
     registry.register(WebFetchTool())
-    registry.register(SkillManagerTool(config.resolved_skills_local_dir()))
+    skill_manager_tool = SkillManagerTool(config.resolved_skills_local_dir(), skills_dir=config.resolved_skills_dir())
+    registry.register(skill_manager_tool)
+    skill_manager_tool.set_known_tool_names(set(registry.names()))
 
     policy = ToolPolicy(workspace=workspace, skills_local=config.resolved_skills_local_dir())
+    skill_manager_tool.set_known_capabilities(set(policy.KNOWN_CAPABILITIES))
     runner = ToolRunner(registry=registry, policy=policy, logger=runtime_logger.getChild("tools.runner"))
 
     memory = MemoryStore(
@@ -211,6 +214,8 @@ def _build_runtime(
         context_weaver=ContextWeaver(token_budget=config.token_budget),
         tool_names=registry.names(),
         workspace=str(workspace),
+        skills_dir=str(config.resolved_skills_dir()),
+        skills_local=str(config.resolved_skills_local_dir()),
         max_steps=config.max_steps,
         logger=runtime_logger.getChild("loop"),
     )

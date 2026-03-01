@@ -115,27 +115,50 @@ class ToolRunner:
 
     @staticmethod
     def _summarize_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        source_skill = str(args.get("_source_skill") or args.get("source_skill") or "").strip()
         if tool_name == "write_file":
-            return {
+            summary = {
                 "path": args.get("path"),
                 "mode": args.get("mode", "overwrite"),
                 "content_len": len(str(args.get("content", ""))),
             }
+            if source_skill:
+                summary["source_skill"] = source_skill
+            return summary
         if tool_name == "read_file":
-            return {"path": args.get("path"), "max_chars": args.get("max_chars", 4000)}
+            summary = {"path": args.get("path"), "max_chars": args.get("max_chars", 4000)}
+            if source_skill:
+                summary["source_skill"] = source_skill
+            return summary
         if tool_name == "shell":
-            return {"cmd": redact_text(str(args.get("cmd", ""))), "timeout_seconds": args.get("timeout_seconds")}
+            summary = {"cmd": redact_text(str(args.get("cmd", ""))), "timeout_seconds": args.get("timeout_seconds")}
+            if source_skill:
+                summary["source_skill"] = source_skill
+            return summary
         if tool_name == "web_fetch":
-            return {"url": args.get("url"), "max_chars": args.get("max_chars", 5000)}
+            summary = {"url": args.get("url"), "max_chars": args.get("max_chars", 5000)}
+            if source_skill:
+                summary["source_skill"] = source_skill
+            return summary
         if tool_name == "web_search":
             query = str(args.get("query", ""))
-            return {"query_len": len(query), "max_results": args.get("max_results", 5)}
+            summary = {"query_len": len(query), "max_results": args.get("max_results", 5)}
+            if source_skill:
+                summary["source_skill"] = source_skill
+            return summary
         if tool_name == "skill_manager":
             summary = {
                 "action": args.get("action"),
                 "name": args.get("name"),
+                "skill_id": args.get("skill_id"),
+                "target": args.get("target"),
             }
-            if str(args.get("action", "")) == "install":
+            if str(args.get("action", "")) in {"install", "generate"}:
                 summary["content_len"] = len(str(args.get("content", "")))
+            if source_skill:
+                summary["source_skill"] = source_skill
             return summary
-        return {"arg_keys": ",".join(sorted(args.keys()))}
+        summary = {"arg_keys": ",".join(sorted(args.keys()))}
+        if source_skill:
+            summary["source_skill"] = source_skill
+        return summary

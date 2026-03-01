@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from aha.core.context import ContextInput, ContextWeaver
 from aha.core.session import RuntimeSessionState, Session
@@ -11,6 +12,7 @@ from aha.providers.base import LLMProvider
 from aha.runtime_log import log_event, session_context, step_context, tool_context
 from aha.tools.base import ToolResult
 from aha.tools.memory import MemoryStore
+from aha.tools.skill_resolution import resolve_skill_views
 from aha.tools.runner import ToolRunner
 
 ConfirmFn = Callable[[str], Awaitable[bool]]
@@ -25,6 +27,8 @@ class AgentLoop:
         context_weaver: ContextWeaver,
         tool_names: list[str],
         workspace: str,
+        skills_dir: str | None = None,
+        skills_local: str | None = None,
         max_steps: int = 30,
         logger: logging.Logger | None = None,
     ):
@@ -34,6 +38,8 @@ class AgentLoop:
         self.context_weaver = context_weaver
         self.tool_names = tool_names
         self.workspace = workspace
+        self.skills_dir = Path(skills_dir).resolve() if skills_dir else None
+        self.skills_local = Path(skills_local).resolve() if skills_local else None
         self.max_steps = max_steps
         self.logger = logger or logging.getLogger("aha.loop")
 
@@ -48,11 +54,18 @@ class AgentLoop:
         with session_context(session_id):
             session.messages.append({"role": "user", "content": user_input})
             memory_text = self.memory.read_memory()
+            active_skills = self._active_skills()
+            session.active_skills = active_skills
+            session_state.active_skills = {
+                str(item.get("name")): item
+                for item in active_skills
+                if str(item.get("name", "")).strip()
+            }
             system_prompt = self.context_weaver.build(
                 ContextInput(
                     workspace=self._workspace_path(),
                     memory_text=memory_text,
-                    active_skill_names=[],
+                    active_skills=active_skills,
                     tool_names=self.tool_names,
                 )
             )
@@ -114,6 +127,7 @@ class AgentLoop:
 
                     for tool_call in response.tool_calls:
                         with tool_context(tool_call.name):
+                            source_skill = self._extract_source_skill(tool_call.arguments)
                             self.memory.append_trace(
                                 {
                                     "session_id": session_id,
@@ -121,6 +135,7 @@ class AgentLoop:
                                     "step": step,
                                     "tool": tool_call.name,
                                     "args": tool_call.arguments,
+                                    "source_skill": source_skill,
                                 }
                             )
                             log_event(
@@ -129,6 +144,7 @@ class AgentLoop:
                                 level=logging.DEBUG,
                                 step=step,
                                 tool_call=tool_call.name,
+                                source_skill=source_skill or "",
                             )
                             try:
                                 result = await self.tool_runner.run(
@@ -172,6 +188,7 @@ class AgentLoop:
                                     "event": "tool_result",
                                     "step": step,
                                     "tool": tool_call.name,
+                                    "source_skill": source_skill,
                                     "status": "ok" if result.ok else "error",
                                     "observation": result.data or "",
                                 }
@@ -189,6 +206,15 @@ class AgentLoop:
         return [self.tool_runner.registry.get(name).schema() for name in self.tool_names]
 
     def _workspace_path(self):
-        from pathlib import Path
-
         return Path(self.workspace)
+
+    def _active_skills(self) -> list[dict]:
+        views = resolve_skill_views(skills_dir=self.skills_dir, skills_local_dir=self.skills_local)
+        return views["effective"]
+
+    @staticmethod
+    def _extract_source_skill(args: dict | None) -> str | None:
+        if not isinstance(args, dict):
+            return None
+        source_skill = str(args.get("_source_skill") or args.get("source_skill") or "").strip()
+        return source_skill or None
