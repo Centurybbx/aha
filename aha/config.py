@@ -26,6 +26,7 @@ class AhaConfig(BaseModel):
     trace_max_chars: int = 1200
     trace_max_bytes: int = 2_000_000
     runtime_log_enabled: bool = True
+    runtime_log_console: bool = False
     runtime_log_dir: Path = Field(default=Path("logs"))
     runtime_log_level: str | None = None
     runtime_log_max_bytes: int = 2_000_000

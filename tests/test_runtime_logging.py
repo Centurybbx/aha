@@ -91,3 +91,27 @@ def test_cli_debug_flag_writes_start_event(tmp_path):
     assert log_path.exists()
     content = log_path.read_text(encoding="utf-8")
     assert "event=chat_start" in content
+
+
+def test_cli_debug_console_uses_readable_summary(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = {
+        "provider": "mock",
+        "model": "mock-model",
+        "workspace_dir": str(workspace),
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["chat", "--provider", "mock", "--config-path", str(config_path), "--debug", "--prompt", "hello"],
+    )
+
+    assert result.exit_code == 0
+    assert "[chat] started" in result.output
+    assert "[turn] start" in result.output
+    assert "[step 1] model response" in result.output
+    assert "event=llm_response" not in result.output

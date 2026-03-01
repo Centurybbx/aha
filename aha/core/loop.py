@@ -9,6 +9,7 @@ from aha.core.context import ContextInput, ContextWeaver
 from aha.core.session import RuntimeSessionState, Session
 from aha.providers.base import LLMProvider
 from aha.runtime_log import log_event, session_context, step_context, tool_context
+from aha.tools.base import ToolResult
 from aha.tools.memory import MemoryStore
 from aha.tools.runner import ToolRunner
 
@@ -129,12 +130,25 @@ class AgentLoop:
                                 step=step,
                                 tool_call=tool_call.name,
                             )
-                            result = await self.tool_runner.run(
-                                tool_call.name,
-                                tool_call.arguments,
-                                session_state=session_state,
-                                confirm=confirm,
-                            )
+                            try:
+                                result = await self.tool_runner.run(
+                                    tool_call.name,
+                                    tool_call.arguments,
+                                    session_state=session_state,
+                                    confirm=confirm,
+                                )
+                            except Exception as exc:
+                                self.logger.error(
+                                    "Unhandled tool exception for %s: %s",
+                                    tool_call.name,
+                                    exc,
+                                    exc_info=True,
+                                )
+                                result = ToolResult(
+                                    ok=False,
+                                    data=f"Internal error running {tool_call.name}: {exc}",
+                                    warnings=["unhandled_exception"],
+                                )
                             tool_payload = {
                                 "ok": result.ok,
                                 "data": result.data,

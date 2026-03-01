@@ -51,6 +51,25 @@ uv run aha --debug
 uv run aha chat --debug
 ```
 
+In debug mode, AHA streams a developer-readable trace to the console (turn/step/tool summaries, policy decisions, timings, errors).
+It is redacted and does **not** print private chain-of-thought.
+
+Example debug output:
+
+```text
+[chat] started session=... provider=... model=...
+[turn] start session=... user_len=...
+[step 1] model response latency=312ms tool_calls=1 text_len=0
+[tool read_file] precheck allow=true confirm=false reason=allowed path=README.md
+[tool read_file] run end ok=true duration=2ms warnings=0 redactions=0
+[turn] final step=2 text_len=428
+```
+Disable console streaming if you only want the log file:
+
+```bash
+uv run aha --debug --no-debug-console
+```
+
 Override runtime logging:
 
 ```bash

@@ -81,16 +81,21 @@ class ToolRunner:
             )
             return result
         except Exception as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
             log_event(
                 self.logger,
                 "tool_run_error",
                 level=logging.ERROR,
                 tool_name=tool_name,
-                duration_ms=int((time.perf_counter() - started) * 1000),
+                duration_ms=duration_ms,
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
-            raise
+            return ToolResult(
+                ok=False,
+                data=f"Tool error ({type(exc).__name__}): {exc}",
+                warnings=["tool_exception"],
+            )
         finally:
             for capability in temporary_grants:
                 session_state.capabilities.discard(capability)

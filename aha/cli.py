@@ -38,6 +38,11 @@ console = Console()
 def main(
     ctx: typer.Context,
     debug: bool = typer.Option(False, "--debug", help="Enable debug runtime logging"),
+    debug_console: Optional[bool] = typer.Option(
+        None,
+        "--debug-console/--no-debug-console",
+        help="Print runtime events to the console (defaults to on in --debug mode)",
+    ),
     log_level: Optional[str] = typer.Option(None, "--log-level", help="Override runtime log level"),
     log_dir: Optional[Path] = typer.Option(None, "--log-dir", help="Override runtime log directory"),
     no_runtime_log: bool = typer.Option(False, "--no-runtime-log", help="Disable runtime log output"),
@@ -64,6 +69,7 @@ def main(
             prompt="",
             config_path=None,
             debug=debug,
+            debug_console=debug_console,
             log_level=log_level,
             log_dir=log_dir,
             no_runtime_log=no_runtime_log,
@@ -109,13 +115,19 @@ def _provider_overrides(
 def _runtime_overrides(
     *,
     debug: bool,
+    debug_console: bool | None,
     log_level: str | None,
     log_dir: Path | None,
     no_runtime_log: bool,
 ) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
-    if debug:
+    if debug or debug_console is True:
         overrides["runtime_log_mode"] = "debug"
+    if debug_console is None:
+        if debug:
+            overrides["runtime_log_console"] = True
+    else:
+        overrides["runtime_log_console"] = bool(debug_console)
     if log_level:
         overrides["runtime_log_level"] = log_level.strip()
     if log_dir is not None:
@@ -270,6 +282,11 @@ def chat(
     prompt: str = typer.Option("", help="One-shot prompt and exit"),
     config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
     debug: bool = typer.Option(False, "--debug", help="Enable debug runtime logging"),
+    debug_console: Optional[bool] = typer.Option(
+        None,
+        "--debug-console/--no-debug-console",
+        help="Print runtime events to the console (defaults to on in --debug mode)",
+    ),
     log_level: Optional[str] = typer.Option(None, "--log-level", help="Override runtime log level"),
     log_dir: Optional[Path] = typer.Option(None, "--log-dir", help="Override runtime log directory"),
     no_runtime_log: bool = typer.Option(False, "--no-runtime-log", help="Disable runtime log output"),
@@ -288,6 +305,7 @@ def chat(
     )
     runtime_overrides = _runtime_overrides(
         debug=debug,
+        debug_console=debug_console,
         log_level=log_level,
         log_dir=log_dir,
         no_runtime_log=no_runtime_log,
@@ -414,6 +432,11 @@ def doctor(
     max_completion_tokens: Optional[int] = typer.Option(None, help="Max completion tokens"),
     config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
     debug: bool = typer.Option(False, "--debug", help="Enable debug runtime logging"),
+    debug_console: Optional[bool] = typer.Option(
+        None,
+        "--debug-console/--no-debug-console",
+        help="Print runtime events to the console (debug only; ignored for doctor)",
+    ),
     log_level: Optional[str] = typer.Option(None, "--log-level", help="Override runtime log level"),
     log_dir: Optional[Path] = typer.Option(None, "--log-dir", help="Override runtime log directory"),
     no_runtime_log: bool = typer.Option(False, "--no-runtime-log", help="Disable runtime log output"),
@@ -433,6 +456,7 @@ def doctor(
     )
     runtime_overrides = _runtime_overrides(
         debug=debug,
+        debug_console=debug_console,
         log_level=log_level,
         log_dir=log_dir,
         no_runtime_log=no_runtime_log,

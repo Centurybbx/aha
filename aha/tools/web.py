@@ -34,10 +34,25 @@ class WebSearchTool(Tool):
         max_results = int(args.get("max_results", 5))
         url = "https://api.duckduckgo.com/"
         params = {"q": query, "format": "json", "no_html": 1, "no_redirect": 1}
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            payload = response.json()
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            return ToolResult(
+                ok=False,
+                data=f"Search request failed: HTTP {exc.response.status_code} for {url}",
+                warnings=["http_error"],
+                meta={"query": query},
+            )
+        except httpx.RequestError as exc:
+            return ToolResult(
+                ok=False,
+                data=f"Search request failed: {type(exc).__name__}: {exc}",
+                warnings=["request_error"],
+                meta={"query": query},
+            )
 
         rows: list[dict[str, str]] = []
         abstract_text = payload.get("AbstractText")
@@ -85,11 +100,26 @@ class WebFetchTool(Tool):
     async def run(self, args: dict[str, Any]) -> ToolResult:
         url = str(args["url"])
         max_chars = int(args.get("max_chars", 5000))
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            body = response.text
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                body = response.text
+        except httpx.HTTPStatusError as exc:
+            return ToolResult(
+                ok=False,
+                data=f"Fetch failed: HTTP {exc.response.status_code} for {url}",
+                warnings=["http_error"],
+                meta={"url": url},
+            )
+        except httpx.RequestError as exc:
+            return ToolResult(
+                ok=False,
+                data=f"Fetch failed: {type(exc).__name__}: {exc}",
+                warnings=["request_error"],
+                meta={"url": url},
+            )
 
         if "html" in content_type.lower():
             body = _strip_html(body)
