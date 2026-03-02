@@ -586,7 +586,12 @@ def _print_session_banner(session_id: str, config: AnaConfig) -> None:
     )
 
 
-def _build_im_channels(config: AnaConfig, bus: MessageBus) -> list[BaseChannel]:
+def _build_im_channels(
+    config: AnaConfig,
+    bus: MessageBus,
+    *,
+    logger: logging.Logger | None = None,
+) -> list[BaseChannel]:
     channels_cfg = dict(config.channels or {})
     built: list[BaseChannel] = []
 
@@ -600,6 +605,7 @@ def _build_im_channels(config: AnaConfig, bus: MessageBus) -> list[BaseChannel]:
                     bus=bus,
                     allow_from=[str(item) for item in telegram_cfg.get("allow_from", [])],
                     allow_chats=[str(item) for item in telegram_cfg.get("allow_chats", [])],
+                    logger=logger.getChild("telegram") if logger else None,
                 )
             )
 
@@ -854,11 +860,19 @@ def serve(
         raise typer.Exit(code=1)
 
     bus = MessageBus()
-    channels = _build_im_channels(effective_config, bus)
+    channels = _build_im_channels(
+        effective_config,
+        bus,
+        logger=runtime_logger.getChild("channels"),
+    )
     if not channels:
         console.print("[red]No enabled IM channels found in config.channels[/red]")
         raise typer.Exit(code=2)
-    manager = ChannelManager(bus=bus, channels=channels)
+    manager = ChannelManager(
+        bus=bus,
+        channels=channels,
+        logger=runtime_logger.getChild("channels.manager"),
+    )
     runtime = IMRuntime(
         agent_loop=loop,
         session_store=store,
@@ -890,14 +904,53 @@ def serve(
         try:
             while True:
                 await asyncio.sleep(3600)
+        except Exception as exc:
+            log_event(
+                runtime_logger.getChild("cli"),
+                "serve_runtime_error",
+                level=logging.ERROR,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
         finally:
-            await runtime.stop()
-            await manager.stop()
+            try:
+                await runtime.stop()
+            except Exception as exc:
+                log_event(
+                    runtime_logger.getChild("cli"),
+                    "serve_runtime_stop_error",
+                    level=logging.ERROR,
+                    component="im_runtime",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            try:
+                await manager.stop()
+            except Exception as exc:
+                log_event(
+                    runtime_logger.getChild("cli"),
+                    "serve_runtime_stop_error",
+                    level=logging.ERROR,
+                    component="channel_manager",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
 
     try:
         asyncio.run(_serve_forever())
     except KeyboardInterrupt:
         console.print("stopped")
+    except Exception as exc:
+        log_event(
+            runtime_logger.getChild("cli"),
+            "serve_crash",
+            level=logging.ERROR,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        console.print(f"[red]IM serve crashed: {type(exc).__name__}: {exc}[/red]")
+        raise typer.Exit(code=1)
 
 
 @app.command("im")

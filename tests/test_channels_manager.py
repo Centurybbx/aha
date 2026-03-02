@@ -28,6 +28,18 @@ class FakeChannel(BaseChannel):
         self.sent.append((content, reply_to))
 
 
+class FlakyChannel(FakeChannel):
+    def __init__(self, name: str) -> None:
+        super().__init__(name=name)
+        self._calls = 0
+
+    async def send(self, chat_id: str, content: str, reply_to: str | None = None, metadata: dict | None = None) -> None:
+        self._calls += 1
+        if self._calls == 1:
+            raise RuntimeError("simulated send failure")
+        await super().send(chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata)
+
+
 def test_channel_manager_splits_discord_messages_and_keeps_reply_only_first_chunk() -> None:
     async def _run() -> None:
         bus = MessageBus()
@@ -54,3 +66,20 @@ def test_channel_manager_splits_discord_messages_and_keeps_reply_only_first_chun
 
     asyncio.run(_run())
 
+
+def test_channel_manager_dispatcher_survives_send_error() -> None:
+    async def _run() -> None:
+        bus = MessageBus()
+        channel = FlakyChannel("telegram")
+        manager = ChannelManager(bus=bus, channels=[channel])
+        await manager.start()
+
+        await bus.publish_outbound(OutboundMessage(channel="telegram", chat_id="c1", content="first"))
+        await bus.publish_outbound(OutboundMessage(channel="telegram", chat_id="c1", content="second"))
+
+        await asyncio.sleep(0.05)
+        await manager.stop()
+
+        assert channel.sent == [("second", None)]
+
+    asyncio.run(_run())

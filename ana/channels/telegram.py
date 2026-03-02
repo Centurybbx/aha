@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ana.bus import InboundMessage, MessageBus
 from ana.channels.base import BaseChannel
+from ana.runtime_log import log_event
 
 
 class TelegramChannel(BaseChannel):
@@ -14,11 +16,13 @@ class TelegramChannel(BaseChannel):
         bus: MessageBus,
         allow_from: list[str] | None = None,
         allow_chats: list[str] | None = None,
+        logger: logging.Logger | None = None,
     ) -> None:
         self.token = token
         self.bus = bus
         self.allow_from = {str(item).strip() for item in (allow_from or []) if str(item).strip()}
         self.allow_chats = {str(item).strip() for item in (allow_chats or []) if str(item).strip()}
+        self.logger = logger or logging.getLogger("ana.channels.telegram")
         self._app: Any | None = None
         self._bot_username = ""
         self._bot_id: int | None = None
@@ -94,10 +98,74 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         if self._app is None:
             raise RuntimeError("telegram channel is not started")
-        kwargs: dict[str, Any] = {}
-        if reply_to:
-            kwargs["reply_parameters"] = {"message_id": int(reply_to)}
-        await self._app.bot.send_message(chat_id=int(chat_id), text=content, **kwargs)
+        _ = metadata
+        chat_id_int = int(chat_id)
+        if not reply_to:
+            await self._app.bot.send_message(chat_id=chat_id_int, text=content)
+            return
+        try:
+            reply_id = int(reply_to)
+        except ValueError:
+            log_event(
+                self.logger,
+                "telegram_reply_target_invalid",
+                level=logging.WARNING,
+                chat_id=chat_id,
+                reply_to=reply_to,
+            )
+            await self._app.bot.send_message(chat_id=chat_id_int, text=content)
+            return
+        try:
+            await self._app.bot.send_message(
+                chat_id=chat_id_int,
+                text=content,
+                reply_parameters={"message_id": reply_id},
+            )
+            return
+        except TypeError as exc:
+            if "reply_parameters" not in str(exc):
+                log_event(
+                    self.logger,
+                    "telegram_send_error",
+                    level=logging.ERROR,
+                    chat_id=chat_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                raise
+            log_event(
+                self.logger,
+                "telegram_reply_parameters_unsupported",
+                level=logging.WARNING,
+                chat_id=chat_id,
+                error=str(exc),
+            )
+        except Exception as exc:
+            log_event(
+                self.logger,
+                "telegram_send_error",
+                level=logging.ERROR,
+                chat_id=chat_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        try:
+            await self._app.bot.send_message(
+                chat_id=chat_id_int,
+                text=content,
+                reply_to_message_id=reply_id,
+            )
+        except Exception as exc:
+            log_event(
+                self.logger,
+                "telegram_send_error",
+                level=logging.ERROR,
+                chat_id=chat_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
 
     def _allowed_sender(self, user_id: int, username: str | None) -> bool:
         if not self.allow_from:
