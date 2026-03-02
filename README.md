@@ -9,6 +9,54 @@ uv sync
 uv run aha chat --provider mock --prompt "hello"
 ```
 
+## IM Serve (Telegram / Discord)
+
+Install optional IM dependencies:
+
+```bash
+uv sync --extra im
+# or Telegram only:
+uv sync --extra telegram
+```
+
+Add channel config in `~/.aha/config.json`:
+
+```json
+{
+  "provider": "litellm",
+  "model": "openai/your-model-name",
+  "api_key_env": "AHA_LLM_API_KEY",
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "<TELEGRAM_BOT_TOKEN>",
+      "allow_from": ["123456789", "@your_username"],
+      "allow_chats": ["123456789"]
+    },
+    "discord": {
+      "enabled": false,
+      "token": "",
+      "allow_from": [],
+      "allow_channels": []
+    }
+  },
+  "im_auto_approve": false
+}
+```
+
+Start IM runtime:
+
+```bash
+uv run aha serve
+# alias:
+uv run aha im
+```
+
+Notes:
+- `im_auto_approve: false` keeps side-effect tools (write/shell) denied by default in IM mode.
+- Empty `allow_from` / `allow_chats` means no whitelist restriction.
+- Group chat responses use mention/reply gating.
+
 ## Real Model (LiteLLM)
 
 Create `~/.aha/config.json`:

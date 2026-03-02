@@ -42,6 +42,8 @@ class AhaConfig(BaseModel):
     evolution_run_on_startup: bool = True
     evolution_dataset_overrides: dict[str, str] = Field(default_factory=dict)
     evolution_baseline_file: str | None = None
+    channels: dict[str, Any] = Field(default_factory=dict)
+    im_auto_approve: bool = False
 
     workspace_dir: Path = Field(default_factory=Path.cwd)
     sessions_dir: Path = Field(default=Path("sessions"))

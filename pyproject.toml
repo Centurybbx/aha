@@ -18,6 +18,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+telegram = [
+  "python-telegram-bot>=21.0",
+]
+discord = [
+  "discord.py>=2.4.0",
+]
+im = [
+  "python-telegram-bot>=21.0",
+  "discord.py>=2.4.0",
+]
 dev = [
   "pytest>=8.0.0",
 ]
@@ -26,4 +36,4 @@ dev = [
 aha = "aha.cli:app"
 
 [tool.setuptools]
-packages = ["aha", "aha.core", "aha.providers", "aha.tools"]
+packages = ["aha", "aha.app", "aha.channels", "aha.core", "aha.providers", "aha.tools"]

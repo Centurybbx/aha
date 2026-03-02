@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from aha.app.im_runtime import IMRuntime
+from aha.bus import InboundMessage, MessageBus, session_id_from_key
+from aha.core.context import ContextWeaver
+from aha.core.loop import AgentLoop
+from aha.core.session import SessionStore
+from aha.providers.base import LLMProvider, LLMResponse, LLMToolCall
+from aha.tools.fs import WriteFileTool
+from aha.tools.memory import MemoryStore
+from aha.tools.policy import ToolPolicy
+from aha.tools.registry import ToolRegistry
+from aha.tools.runner import ToolRunner
+
+
+class SleepyEchoProvider(LLMProvider):
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+
+    async def complete(self, messages: list[dict], tools: list[dict]) -> LLMResponse:
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0.03)
+        try:
+            user_text = ""
+            for row in reversed(messages):
+                if row.get("role") == "user":
+                    user_text = str(row.get("content", ""))
+                    break
+            return LLMResponse(
+                content=f"echo:{user_text}",
+                tool_calls=[],
+                raw_message={"role": "assistant", "content": f"echo:{user_text}"},
+            )
+        finally:
+            self.active -= 1
+
+
+class WriteAttemptProvider(LLMProvider):
+    async def complete(self, messages: list[dict], tools: list[dict]) -> LLMResponse:
+        has_tool_result = any(msg.get("role") == "tool" for msg in messages)
+        if not has_tool_result:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    LLMToolCall(
+                        call_id="c1",
+                        name="write_file",
+                        arguments={"path": "out.txt", "content": "hello from im"},
+                    )
+                ],
+                raw_message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "write_file", "arguments": '{"path":"out.txt","content":"hello from im"}'},
+                        }
+                    ],
+                },
+            )
+        return LLMResponse(
+            content="done",
+            tool_calls=[],
+            raw_message={"role": "assistant", "content": "done"},
+        )
+
+
+def _build_loop(workspace: Path, provider: LLMProvider) -> AgentLoop:
+    skills_local = workspace / "skills_local"
+    skills_local.mkdir(parents=True, exist_ok=True)
+
+    registry = ToolRegistry()
+    registry.register(WriteFileTool(workspace=workspace, skills_local=skills_local))
+    policy = ToolPolicy(workspace=workspace, skills_local=skills_local)
+    memory = MemoryStore(
+        memory_file=workspace / "memory" / "MEMORY.md",
+        trace_file=workspace / "memory" / "TRACE.jsonl",
+        include_sensitive_data=False,
+        trace_max_chars=1200,
+        trace_max_bytes=2_000_000,
+    )
+    runner = ToolRunner(registry=registry, policy=policy)
+    return AgentLoop(
+        provider=provider,
+        tool_runner=runner,
+        memory=memory,
+        context_weaver=ContextWeaver(token_budget=8000),
+        tool_names=registry.names(),
+        workspace=str(workspace),
+        max_steps=3,
+    )
+
+
+def test_im_runtime_maps_session_id_and_serializes_same_session(tmp_path: Path) -> None:
+    async def _run() -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        provider = SleepyEchoProvider()
+        loop = _build_loop(workspace, provider)
+        store = SessionStore(workspace / "sessions")
+        bus = MessageBus()
+        runtime = IMRuntime(agent_loop=loop, session_store=store, bus=bus)
+
+        inbound1 = InboundMessage(channel="telegram", sender_id="u1", chat_id="123", content="a")
+        inbound2 = InboundMessage(channel="telegram", sender_id="u1", chat_id="123", content="b")
+        await asyncio.gather(runtime.handle_inbound(inbound1), runtime.handle_inbound(inbound2))
+
+        assert provider.max_active == 1
+        assert (workspace / "sessions" / f"{session_id_from_key('telegram:123')}.json").exists()
+
+        out1 = await bus.next_outbound()
+        out2 = await bus.next_outbound()
+        assert out1.chat_id == "123"
+        assert out2.chat_id == "123"
+
+    asyncio.run(_run())
+
+
+def test_im_runtime_denies_side_effect_by_default(tmp_path: Path) -> None:
+    async def _run() -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        loop = _build_loop(workspace, WriteAttemptProvider())
+        store = SessionStore(workspace / "sessions")
+        bus = MessageBus()
+        runtime = IMRuntime(agent_loop=loop, session_store=store, bus=bus, auto_approve=False)
+        inbound = InboundMessage(channel="discord", sender_id="u2", chat_id="c1", content="write it")
+
+        await runtime.handle_inbound(inbound)
+        out = await bus.next_outbound()
+        assert "done" in out.content
+        target = workspace / "out.txt"
+        assert not target.exists()
+
+    asyncio.run(_run())
+

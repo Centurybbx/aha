@@ -17,6 +17,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
+from aha.app.im_runtime import IMRuntime
+from aha.bus import MessageBus
+from aha.channels.base import BaseChannel
+from aha.channels.discord import DiscordChannel
+from aha.channels.manager import ChannelManager
+from aha.channels.telegram import TelegramChannel
 from aha.config import AhaConfig, load_config
 from aha.core.context import ContextWeaver
 from aha.core.loop import AgentLoop
@@ -580,6 +586,38 @@ def _print_session_banner(session_id: str, config: AhaConfig) -> None:
     )
 
 
+def _build_im_channels(config: AhaConfig, bus: MessageBus) -> list[BaseChannel]:
+    channels_cfg = dict(config.channels or {})
+    built: list[BaseChannel] = []
+
+    telegram_cfg = channels_cfg.get("telegram")
+    if isinstance(telegram_cfg, dict) and bool(telegram_cfg.get("enabled")):
+        token = str(telegram_cfg.get("token") or "").strip()
+        if token:
+            built.append(
+                TelegramChannel(
+                    token=token,
+                    bus=bus,
+                    allow_from=[str(item) for item in telegram_cfg.get("allow_from", [])],
+                    allow_chats=[str(item) for item in telegram_cfg.get("allow_chats", [])],
+                )
+            )
+
+    discord_cfg = channels_cfg.get("discord")
+    if isinstance(discord_cfg, dict) and bool(discord_cfg.get("enabled")):
+        token = str(discord_cfg.get("token") or "").strip()
+        if token:
+            built.append(
+                DiscordChannel(
+                    token=token,
+                    bus=bus,
+                    allow_from=[str(item) for item in discord_cfg.get("allow_from", [])],
+                    allow_channels=[str(item) for item in discord_cfg.get("allow_channels", [])],
+                )
+            )
+    return built
+
+
 @app.command()
 def chat(
     provider: Optional[str] = typer.Option(None, help="Provider name: mock|litellm"),
@@ -761,6 +799,112 @@ def chat(
         if evolution_scheduler is not None:
             evolution_scheduler.stop()
         runner.close()
+
+
+@app.command("serve")
+def serve(
+    provider: Optional[str] = typer.Option(None, help="Provider name: mock|litellm"),
+    model: Optional[str] = typer.Option(None, help="Model name for litellm provider"),
+    api_key: Optional[str] = typer.Option(None, help="Optional API key (avoid shell history in production)"),
+    api_key_env: Optional[str] = typer.Option(None, help="API key env var for litellm"),
+    endpoint: Optional[str] = typer.Option(None, help="Generic endpoint/base URL for litellm"),
+    api_base: Optional[str] = typer.Option(None, help="Optional API base URL for litellm"),
+    api_version: Optional[str] = typer.Option(None, help="Optional API version for litellm"),
+    request_timeout_seconds: Optional[int] = typer.Option(None, help="LLM request timeout in seconds"),
+    temperature: Optional[float] = typer.Option(None, help="LLM temperature"),
+    max_completion_tokens: Optional[int] = typer.Option(None, help="Max completion tokens"),
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug runtime logging"),
+    debug_console: Optional[bool] = typer.Option(
+        None,
+        "--debug-console/--no-debug-console",
+        help="Print runtime events to the console (defaults to on in --debug mode)",
+    ),
+    log_level: Optional[str] = typer.Option(None, "--log-level", help="Override runtime log level"),
+    log_dir: Optional[Path] = typer.Option(None, "--log-dir", help="Override runtime log directory"),
+    no_runtime_log: bool = typer.Option(False, "--no-runtime-log", help="Disable runtime log output"),
+) -> None:
+    provider_overrides = _provider_overrides(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        endpoint=endpoint,
+        api_base=api_base,
+        api_version=api_version,
+        request_timeout_seconds=request_timeout_seconds,
+        temperature=temperature,
+        max_completion_tokens=max_completion_tokens,
+    )
+    runtime_overrides = _runtime_overrides(
+        debug=debug,
+        debug_console=debug_console,
+        log_level=log_level,
+        log_dir=log_dir,
+        no_runtime_log=no_runtime_log,
+    )
+    overrides = {**provider_overrides, **runtime_overrides}
+    try:
+        loop, store, _memory, effective_config, runtime_logger, runtime_log_path = _build_runtime(
+            overrides=overrides,
+            config_path=config_path,
+        )
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    bus = MessageBus()
+    channels = _build_im_channels(effective_config, bus)
+    if not channels:
+        console.print("[red]No enabled IM channels found in config.channels[/red]")
+        raise typer.Exit(code=2)
+    manager = ChannelManager(bus=bus, channels=channels)
+    runtime = IMRuntime(
+        agent_loop=loop,
+        session_store=store,
+        bus=bus,
+        auto_approve=bool(effective_config.im_auto_approve),
+    )
+    if runtime_log_path:
+        console.print(
+            f"[dim]Runtime log: {runtime_log_path} "
+            f"(level={resolve_log_level_name(effective_config)}, mode={effective_config.runtime_log_mode})[/dim]"
+        )
+    console.print(
+        f"[bold green]AHA IM serving[/bold green] channels={','.join(ch.name for ch in channels)} "
+        f"provider={effective_config.provider} model={effective_config.model}"
+    )
+    log_event(
+        runtime_logger.getChild("cli"),
+        "serve_start",
+        level=logging.INFO,
+        channels=[ch.name for ch in channels],
+        provider=effective_config.provider,
+        model=effective_config.model,
+        im_auto_approve=effective_config.im_auto_approve,
+    )
+
+    async def _serve_forever() -> None:
+        await manager.start()
+        await runtime.start()
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            await runtime.stop()
+            await manager.stop()
+
+    try:
+        asyncio.run(_serve_forever())
+    except KeyboardInterrupt:
+        console.print("stopped")
+
+
+@app.command("im")
+def im(
+    config_path: Optional[Path] = typer.Option(None, help="Custom config file path"),
+) -> None:
+    serve(config_path=config_path)
 
 
 @app.command()
