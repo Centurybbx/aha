@@ -12,6 +12,9 @@ proposals/
 
 # Local skills sandbox
 skills_local/
+.bub/
+.clawhub/
+worktree/
 
 # Python / tooling
 .venv/
@@ -21,3 +24,29 @@ __pycache__/
 
 # Packaging artifacts
 *.egg-info/
+
+# Dependencies
+node_modules/
+
+# Build outputs (Rust / Tauri)
+**/target/
+
+# OS files
+.DS_Store
+
+# Secrets and local environment files
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.crt
+**/*.cer
+**/*.mobileprovision
+**/tokens.txt
+*.secret
+*.secrets
+secret.*
+secrets.*
