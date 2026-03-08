@@ -1,0 +1,59 @@
+{
+  "generatedAt": "2026-02-07T06:18:11.663Z",
+  "assets": [
+    {
+      "assetId": "gold",
+      "name": "Gold Spot",
+      "symbol": "XAUUSD",
+      "file": "gold_xauusd.json",
+      "firstDate": "1793-03-01",
+      "lastDate": "2026-02-06",
+      "points": 15176
+    },
+    {
+      "assetId": "nasdaq100",
+      "name": "NASDAQ 100",
+      "symbol": "^NDQ",
+      "file": "nasdaq100.json",
+      "firstDate": "1938-01-03",
+      "lastDate": "2026-02-06",
+      "points": 22753
+    },
+    {
+      "assetId": "sp500",
+      "name": "S&P 500",
+      "symbol": "^SPX",
+      "file": "sp500.json",
+      "firstDate": "1789-05-01",
+      "lastDate": "2026-02-06",
+      "points": 39630
+    },
+    {
+      "assetId": "bitcoin",
+      "name": "Bitcoin",
+      "symbol": "BTCUSD",
+      "file": "bitcoin.json",
+      "firstDate": "2010-07-19",
+      "lastDate": "2026-02-06",
+      "points": 4026
+    },
+    {
+      "assetId": "csi300",
+      "name": "沪深300",
+      "symbol": "000300",
+      "file": "csi300.json",
+      "firstDate": "2005-01-04",
+      "lastDate": "2026-02-06",
+      "points": 5126
+    },
+    {
+      "assetId": "dividend_low_vol_etf",
+      "name": "红利低波ETF",
+      "symbol": "512890",
+      "file": "dividend_low_vol_etf.json",
+      "firstDate": "2019-01-18",
+      "lastDate": "2026-02-06",
+      "points": 1711
+    }
+  ]
+}

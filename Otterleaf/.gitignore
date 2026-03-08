@@ -1,0 +1,7 @@
+# docker image build
+.dockerignore
+
+# user defined files
+.env
+docker-compose.override.yml
+node_modules

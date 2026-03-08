@@ -1,0 +1,1014 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Overleaf Editor Iframe API 演示</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 20px;
+        background-color: #f5f5f5;
+      }
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+      .controls {
+        margin-bottom: 20px;
+        padding: 15px;
+        background: #f8f9fa;
+        border-radius: 5px;
+      }
+      .controls h3 {
+        margin-top: 0;
+        color: #333;
+      }
+      button {
+        background: #007bff;
+        color: white;
+        border: none;
+        padding: 8px 16px;
+        margin: 5px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 14px;
+      }
+      button:hover {
+        background: #0056b3;
+      }
+      button:disabled {
+        background: #6c757d;
+        cursor: not-allowed;
+      }
+      .input-group {
+        margin: 10px 0;
+      }
+      .input-group label {
+        display: inline-block;
+        width: 100px;
+        font-weight: bold;
+      }
+      .input-group input,
+      .input-group textarea {
+        padding: 5px;
+        border: 1px solid #ddd;
+        border-radius: 3px;
+        width: 200px;
+      }
+      .input-group textarea {
+        width: 300px;
+        height: 60px;
+      }
+      .log {
+        background: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 4px;
+        padding: 10px;
+        height: 200px;
+        overflow-y: auto;
+        font-family: monospace;
+        font-size: 12px;
+      }
+      .iframe-container {
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        overflow: hidden;
+      }
+      .status {
+        padding: 10px;
+        margin: 10px 0;
+        border-radius: 4px;
+      }
+      .status.success {
+        background: #d4edda;
+        color: #155724;
+        border: 1px solid #c3e6cb;
+      }
+      .status.error {
+        background: #f8d7da;
+        color: #721c24;
+        border: 1px solid #f5c6cb;
+      }
+      .status.info {
+        background: #d1ecf1;
+        color: #0c5460;
+        border: 1px solid #bee5eb;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Overleaf Editor Iframe API 演示</h1>
+
+      <div class="status info">
+        <strong>说明：</strong> 请将下面的 iframe URL 替换为您的实际 Overleaf
+        项目 URL。此 iframe API 直接调用
+        <code>window.overleafEditorApi</code> 中注册的 API 方法。 <br /><br />
+        <strong>功能说明：</strong>
+        <ul style="margin: 5px 0; padding-left: 20px">
+          <li>
+            <strong>外部API创建项目：</strong>
+            通过外部API创建新项目，需要提供API Token，创建成功后返回项目ID和URL
+          </li>
+          <li>
+            <strong>文件管理：</strong>
+            列出当前项目下的所有文件和文件夹，在项目下创建新文件夹，重命名文件
+          </li>
+          <li>
+            <strong>文件操作：</strong>
+            下载文件（输入文件ID，可选择自定义文件名），上传文件（选择本地文件，可选择自定义文件名和指定文件夹ID）
+          </li>
+          <li>
+            <strong>文件列表：</strong>
+            显示项目中的所有文件和文件夹，包括类型、路径、大小、修改时间等信息，可复制文件ID
+          </li>
+        </ul>
+      </div>
+
+      <div class="controls">
+        <h3>基本操作</h3>
+        <button onclick="getSelection()">获取选中文本</button>
+        <button onclick="getDocument()">获取文档内容</button>
+        <button onclick="recompile()">重新编译</button>
+      </div>
+
+      <div class="controls">
+        <h3>文本操作</h3>
+        <div class="input-group">
+          <label>起始位置:</label>
+          <input type="number" id="fromPos" value="0" min="0" />
+        </div>
+        <div class="input-group">
+          <label>结束位置:</label>
+          <input type="number" id="toPos" value="10" min="0" />
+        </div>
+        <div class="input-group">
+          <label>新文本:</label>
+          <textarea id="newText" placeholder="输入要替换的文本...">
+Hello World!</textarea
+          >
+        </div>
+        <button onclick="setSelection()">设置选中</button>
+        <button onclick="replaceText()">替换文本</button>
+        <button onclick="suggestChange()">建议修改</button>
+      </div>
+
+      <div class="controls">
+        <h3>建议修改管理</h3>
+        <div class="input-group">
+          <label>修改ID:</label>
+          <input type="text" id="changeId" placeholder="从建议修改响应中获取" />
+        </div>
+        <button onclick="acceptChange()">接受修改</button>
+        <button onclick="rejectChange()">拒绝修改</button>
+      </div>
+
+      <div class="controls">
+        <h3>外部API创建项目示例</h3>
+        <div
+          style="
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            font-size: 12px;
+          "
+        >
+          <strong>API使用说明：</strong><br />
+          1. 获取API Token：在Overleaf设置中生成API Token<br />
+          2. 调用外部API：POST /api/project<br />
+          3. 请求头：Authorization: Bearer {token}<br />
+          4. 请求体：{"name": "项目名称"}<br />
+          5. 响应：{"success": true, "projectId": "项目ID"}
+        </div>
+        <div class="input-group">
+          <label>项目名称:</label>
+          <input
+            type="text"
+            id="externalProjectName"
+            placeholder="输入新项目名称"
+          />
+        </div>
+        <div class="input-group">
+          <label>API Token:</label>
+          <input
+            type="password"
+            id="apiToken"
+            placeholder="输入您的API Token"
+          />
+        </div>
+        <button onclick="createProjectExternal()">通过外部API创建项目</button>
+        <button onclick="listProjectFiles()">列出项目文件</button>
+      </div>
+
+      <div class="controls">
+        <h3>文件操作</h3>
+        <div class="input-group">
+          <label>文件ID:</label>
+          <input type="text" id="fileId" placeholder="输入要下载的文件ID" />
+        </div>
+        <div class="input-group">
+          <label>文件名:</label>
+          <input
+            type="text"
+            id="downloadFileName"
+            placeholder="可选的自定义文件名"
+          />
+        </div>
+        <button onclick="downloadFile()">下载文件</button>
+
+        <hr style="margin: 15px 0" />
+
+        <div class="input-group">
+          <label>选择文件:</label>
+          <input type="file" id="fileInput" accept="*/*" />
+        </div>
+        <div class="input-group">
+          <label>上传文件名:</label>
+          <input
+            type="text"
+            id="uploadFileName"
+            placeholder="可选的自定义文件名"
+          />
+        </div>
+        <div class="input-group">
+          <label>文件夹ID:</label>
+          <input
+            type="text"
+            id="folderId"
+            placeholder="可选，留空则上传到根目录"
+          />
+        </div>
+        <button onclick="uploadFile()">上传文件</button>
+      </div>
+
+      <div class="controls">
+        <h3>文件夹操作</h3>
+        <div class="input-group">
+          <label>文件夹名称:</label>
+          <input type="text" id="folderName" placeholder="输入新文件夹名称" />
+        </div>
+        <div class="input-group">
+          <label>父文件夹ID:</label>
+          <input
+            type="text"
+            id="parentFolderId"
+            placeholder="可选，留空则在根目录创建"
+          />
+        </div>
+        <button onclick="createFolder()">创建文件夹</button>
+      </div>
+
+      <div class="controls">
+        <h3>文件重命名</h3>
+        <p style="color: #666; font-size: 12px; margin-bottom: 10px">
+          提示：您可以直接点击下方文件列表中的文件来自动填充表单，或手动输入文件信息。
+        </p>
+        <div class="input-group">
+          <label>文件ID:</label>
+          <input
+            type="text"
+            id="renameFileId"
+            placeholder="输入要重命名的文件ID"
+          />
+        </div>
+        <div class="input-group">
+          <label>新文件名:</label>
+          <input type="text" id="newFileName" placeholder="输入新的文件名" />
+        </div>
+        <div class="input-group">
+          <label>文件类型 (可选):</label>
+          <select id="renameFileType">
+            <option value="">自动检测</option>
+            <option value="doc">文档 (doc)</option>
+            <option value="fileRef">文件引用 (fileRef)</option>
+            <option value="folder">文件夹 (folder)</option>
+          </select>
+          <small
+            style="
+              color: #666;
+              font-size: 11px;
+              display: block;
+              margin-top: 2px;
+            "
+          >
+            选择"自动检测"将根据文件树数据自动确定类型
+          </small>
+        </div>
+        <button onclick="renameFile()">重命名文件</button>
+      </div>
+
+      <div class="controls">
+        <h3>删除文件</h3>
+        <p style="color: #666; font-size: 12px; margin-bottom: 10px">
+          提示：您可以直接点击下方文件列表中的文件来自动填充表单，或手动输入文件信息。
+        </p>
+        <div class="input-group">
+          <label>文件ID:</label>
+          <input
+            type="text"
+            id="deleteFileId"
+            placeholder="输入要删除的文件ID"
+          />
+        </div>
+        <div class="input-group">
+          <label>文件类型 (可选):</label>
+          <select id="deleteFileType">
+            <option value="">自动检测</option>
+            <option value="doc">文档 (doc)</option>
+            <option value="fileRef">文件引用 (fileRef)</option>
+            <option value="folder">文件夹 (folder)</option>
+          </select>
+          <small
+            style="
+              color: #666;
+              font-size: 11px;
+              display: block;
+              margin-top: 2px;
+            "
+          >
+            选择"自动检测"将根据文件树数据自动确定类型
+          </small>
+        </div>
+        <button onclick="deleteFile()" style="background-color: #dc3545; color: white;">删除文件</button>
+      </div>
+
+      <div class="controls">
+        <h3>项目文件列表</h3>
+        <button onclick="refreshFileList()">刷新文件列表</button>
+        <button onclick="setFileTreeDataForDemo()">设置演示文件树数据</button>
+        <div
+          id="fileList"
+          class="log"
+          style="height: 150px; margin-top: 10px"
+        ></div>
+      </div>
+
+      <div class="controls">
+        <h3>日志</h3>
+        <button onclick="clearLog()">清空日志</button>
+        <div id="log" class="log"></div>
+      </div>
+
+      <div class="iframe-container">
+        <iframe
+          id="overleaf-editor"
+          src="http://localhost/project/68e29d6cedafffc388a90203?auth=b3ZlcmxlYWY6b3ZlcmxlYWY="
+          width="100%"
+          height="600px"
+          frameborder="0"
+        >
+        </iframe>
+      </div>
+    </div>
+
+    <script>
+      // 配置
+      const OVERLEAF_ORIGIN = 'http://localhost' // 请替换为您的实际域名
+      const IFRAME_ID = 'overleaf-editor'
+
+      // 状态管理
+      let isIframeLoaded = false
+      let pendingCalls = new Map()
+      let lastChangeId = null
+
+      // 日志功能
+      function log(message, type = 'info') {
+        const logElement = document.getElementById('log')
+        const timestamp = new Date().toLocaleTimeString()
+        const logEntry = document.createElement('div')
+        logEntry.innerHTML = `[${timestamp}] ${message}`
+        logEntry.style.color =
+          type === 'error' ? '#dc3545' : type === 'success' ? '#28a745' : '#333'
+        logElement.appendChild(logEntry)
+        logElement.scrollTop = logElement.scrollHeight
+      }
+
+      function clearLog() {
+        document.getElementById('log').innerHTML = ''
+      }
+
+      // 消息监听器
+      window.addEventListener('message', function (event) {
+        const { type, callId, success, result, error } = event.data
+
+        if (type === 'apiResponse' && pendingCalls.has(callId)) {
+          const { resolve, reject } = pendingCalls.get(callId)
+          pendingCalls.delete(callId)
+
+          if (success) {
+            log(`API 调用成功: ${JSON.stringify(result)}`, 'success')
+            resolve(result)
+          } else {
+            log(`API 调用失败: ${error}`, 'error')
+            reject(new Error(error))
+          }
+        }
+      })
+
+      // iframe 加载完成
+      document.getElementById(IFRAME_ID).addEventListener('load', function () {
+        isIframeLoaded = true
+        log('Overleaf 编辑器已加载', 'success')
+      })
+
+      // API 调用函数
+      function callEditorApi(api, method, params = []) {
+        console.log(api, method, params, 'call')
+        if (!isIframeLoaded) {
+          log('编辑器尚未加载完成，请稍后再试', 'error')
+          return Promise.reject(new Error('编辑器未加载'))
+        }
+
+        return new Promise((resolve, reject) => {
+          const callId =
+            'call_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9)
+
+          pendingCalls.set(callId, { resolve, reject })
+
+          const iframe = document.getElementById(IFRAME_ID)
+          if (iframe && iframe.contentWindow) {
+            iframe.contentWindow.postMessage(
+              {
+                type: 'apiCall',
+                api: api,
+                method: method,
+                params: params,
+                callId: callId,
+              },
+              OVERLEAF_ORIGIN
+            )
+
+            log(`发送 API 调用: ${api}.${method}(${JSON.stringify(params)})`)
+          } else {
+            reject(new Error('Iframe 未找到或未加载'))
+          }
+        })
+      }
+
+      // 设置文件树数据的函数（用于演示）
+      function setFileTreeDataForDemo() {
+        // 这是一个模拟的文件树数据结构
+        const mockFileTreeData = {
+          _id: 'root-folder-id',
+          name: '',
+          folders: [
+            {
+              _id: 'folder-1',
+              name: 'documents',
+              folders: [],
+              docs: [
+                {
+                  _id: 'doc-1',
+                  name: 'main.tex',
+                  path: '/main.tex',
+                },
+              ],
+              fileRefs: [
+                {
+                  _id: 'file-1',
+                  name: 'image.png',
+                  path: '/image.png',
+                },
+              ],
+            },
+          ],
+          docs: [
+            {
+              _id: 'doc-2',
+              name: 'readme.tex',
+              path: '/readme.tex',
+            },
+          ],
+          fileRefs: [
+            {
+              _id: 'file-2',
+              name: 'config.json',
+              path: '/config.json',
+            },
+          ],
+        }
+
+        // 设置全局文件树数据
+        if (
+          window.overleafEditorApi &&
+          window.overleafEditorApi.setFileTreeData
+        ) {
+          window.overleafEditorApi.setFileTreeData(mockFileTreeData)
+          log('文件树数据已设置用于演示', 'success')
+        } else {
+          log('setFileTreeData 方法不可用', 'error')
+        }
+      }
+
+      // 具体 API 方法
+      async function getSelection() {
+        try {
+          const result = await callEditorApi('editor', 'getSelection')
+          log(`选中文本: ${JSON.stringify(result)}`, 'success')
+        } catch (error) {
+          log(`获取选中文本失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function setSelection() {
+        const from = parseInt(document.getElementById('fromPos').value)
+        const to = parseInt(document.getElementById('toPos').value)
+
+        try {
+          await callEditorApi('editor', 'setSelection', [from, to])
+          log(`选中范围设置为: ${from}-${to}`, 'success')
+        } catch (error) {
+          log(`设置选中范围失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function replaceText() {
+        const from = parseInt(document.getElementById('fromPos').value)
+        const to = parseInt(document.getElementById('toPos').value)
+        const text = document.getElementById('newText').value
+
+        try {
+          await callEditorApi('editor', 'replaceText', [from, to, text])
+          log(`文本替换成功: ${from}-${to} -> "${text}"`, 'success')
+        } catch (error) {
+          log(`文本替换失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function suggestChange() {
+        const from = parseInt(document.getElementById('fromPos').value)
+        const to = parseInt(document.getElementById('toPos').value)
+        const text = document.getElementById('newText').value
+
+        try {
+          const result = await callEditorApi('editor', 'suggestChange', [
+            from,
+            to,
+            text,
+          ])
+          lastChangeId = result.changeId
+          document.getElementById('changeId').value = result.changeId
+          log(`建议修改创建成功，ID: ${result.changeId}`, 'success')
+        } catch (error) {
+          log(`创建建议修改失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function acceptChange() {
+        const changeId =
+          document.getElementById('changeId').value || lastChangeId
+
+        if (!changeId) {
+          log('请先创建建议修改或输入修改ID', 'error')
+          return
+        }
+
+        try {
+          await callEditorApi('editor', 'acceptChange', [changeId])
+          log(`建议修改已接受: ${changeId}`, 'success')
+        } catch (error) {
+          log(`接受建议修改失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function rejectChange() {
+        const changeId =
+          document.getElementById('changeId').value || lastChangeId
+
+        if (!changeId) {
+          log('请先创建建议修改或输入修改ID', 'error')
+          return
+        }
+
+        try {
+          await callEditorApi('editor', 'rejectChange', [changeId])
+          log(`建议修改已拒绝: ${changeId}`, 'success')
+        } catch (error) {
+          log(`拒绝建议修改失败: ${error.message}`, 'error')
+        }
+      }
+
+      // 下载文件
+      async function downloadFile() {
+        const fileId = document.getElementById('fileId').value
+        const fileName = document.getElementById('downloadFileName').value
+
+        if (!fileId) {
+          log('请输入文件ID', 'error')
+          return
+        }
+
+        try {
+          const params = fileName ? [fileId, fileName] : [fileId]
+          const result = await callEditorApi('editor', 'downloadFile', params)
+
+          if (result.success && result.downloadUrl) {
+            log(`文件下载URL生成成功: ${result.downloadUrl}`, 'success')
+            // 自动打开下载链接
+            window.open(result.downloadUrl, '_blank')
+          } else {
+            log(`文件下载失败: ${result.error || '未知错误'}`, 'error')
+          }
+        } catch (error) {
+          log(`下载文件失败: ${error.message}`, 'error')
+        }
+      }
+
+      // 上传文件
+      async function uploadFile() {
+        const fileInput = document.getElementById('fileInput')
+        const fileName = document.getElementById('uploadFileName').value
+        const folderId = document.getElementById('folderId').value
+
+        if (!fileInput.files || fileInput.files.length === 0) {
+          log('请选择要上传的文件', 'error')
+          return
+        }
+
+        const file = fileInput.files[0]
+
+        try {
+          const params = [file]
+
+          if (fileName) {
+            params.push(fileName)
+          } else {
+            params.push(undefined)
+          }
+
+          if (folderId) {
+            params.push(folderId)
+          } else {
+            params.push(undefined)
+          }
+
+          const result = await callEditorApi('editor', 'uploadFile', params)
+
+          if (result.success) {
+            log(
+              `文件上传成功！实体ID: ${result.entityId}，哈希: ${result.hash}`,
+              'success'
+            )
+            // 清空文件输入
+            fileInput.value = ''
+            document.getElementById('uploadFileName').value = ''
+            document.getElementById('folderId').value = ''
+          } else {
+            log(`文件上传失败: ${result.error || '未知错误'}`, 'error')
+            // 显示更详细的错误信息
+            if (result.error && result.error.includes('HTTP')) {
+              log(`HTTP错误详情: ${result.error}`, 'error')
+            }
+          }
+        } catch (error) {
+          log(`上传文件失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function getDocument() {
+        try {
+          const result = await callEditorApi('editor', 'getDocument', [true])
+          log(
+            `文档内容获取成功，长度: ${result.content.length} 字符`,
+            'success'
+          )
+          log(
+            `建议修改数量: ${result.changes ? result.changes.length : 0}`,
+            'info'
+          )
+        } catch (error) {
+          log(`获取文档内容失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function recompile() {
+        try {
+          await callEditorApi('editor', 'recompile', [{}])
+          log('重新编译成功', 'success')
+        } catch (error) {
+          log(`重新编译失败: ${error.message}`, 'error')
+        }
+      }
+
+      // 外部API创建项目功能
+      async function createProjectExternal() {
+        const projectName = document.getElementById('externalProjectName').value
+        const apiToken = document.getElementById('apiToken').value
+
+        if (!projectName) {
+          log('请输入项目名称', 'error')
+          return
+        }
+
+        if (!apiToken) {
+          log('请输入API Token', 'error')
+          return
+        }
+
+        try {
+          // 使用外部API创建项目
+          const response = await fetch('http://localhost/api/project', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${apiToken}`,
+            },
+            body: JSON.stringify({
+              name: projectName,
+            }),
+          })
+
+          if (!response.ok) {
+            const errorText = await response.text()
+            log(
+              `外部API请求失败: HTTP ${response.status} - ${errorText}`,
+              'error'
+            )
+            return
+          }
+
+          const result = await response.json()
+
+          if (result.success && result.projectId) {
+            log(`项目创建成功！项目ID: ${result.projectId}`, 'success')
+            log(
+              `项目URL: ${window.location.origin}/project/${result.projectId}`,
+              'info'
+            )
+            document.getElementById('externalProjectName').value = ''
+            document.getElementById('apiToken').value = ''
+          } else {
+            log(`项目创建失败: ${result.error || '未知错误'}`, 'error')
+          }
+        } catch (error) {
+          log(`创建项目失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function listProjectFiles() {
+        try {
+          const result = await callEditorApi('project', 'listProjectFiles', [])
+
+          if (result.success && result.files) {
+            log(
+              `项目文件列表获取成功，共 ${result.files.length} 个文件/文件夹`,
+              'success'
+            )
+            displayFileList(result.files)
+          } else {
+            log(`获取文件列表失败: ${result.error || '未知错误'}`, 'error')
+          }
+        } catch (error) {
+          log(`获取文件列表失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function createFolder() {
+        const folderName = document.getElementById('folderName').value
+        const parentFolderId = document.getElementById('parentFolderId').value
+
+        if (!folderName) {
+          log('请输入文件夹名称', 'error')
+          return
+        }
+
+        try {
+          const params = [folderName]
+          if (parentFolderId) {
+            params.push(parentFolderId)
+          }
+
+          const result = await callEditorApi('project', 'createFolder', params)
+
+          if (result.success && result.folderId) {
+            log(`文件夹创建成功！文件夹ID: ${result.folderId}`, 'success')
+            document.getElementById('folderName').value = ''
+            document.getElementById('parentFolderId').value = ''
+            // 自动刷新文件列表
+            await listProjectFiles()
+          } else {
+            log(`文件夹创建失败: ${result.error || '未知错误'}`, 'error')
+          }
+        } catch (error) {
+          log(`创建文件夹失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function renameFile() {
+        const fileId = document.getElementById('renameFileId').value
+        const newName = document.getElementById('newFileName').value
+        const entityType = document.getElementById('renameFileType').value
+
+        if (!fileId || !newName) {
+          log('请输入文件ID和新文件名', 'error')
+          return
+        }
+
+        try {
+          // 构建参数数组，如果entityType为空则不传递
+          const params = [fileId, newName]
+          if (entityType) {
+            params.push(entityType)
+          }
+
+          const result = await callEditorApi('project', 'renameFile', params)
+
+          if (result.success) {
+            log(
+              `文件重命名成功！${entityType ? ` (类型: ${entityType})` : ''}`,
+              'success'
+            )
+            document.getElementById('renameFileId').value = ''
+            document.getElementById('newFileName').value = ''
+            document.getElementById('renameFileType').value = ''
+            // 自动刷新文件列表
+            await listProjectFiles()
+          } else {
+            log(`文件重命名失败: ${result.error || '未知错误'}`, 'error')
+          }
+        } catch (error) {
+          log(`重命名文件失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function deleteFile() {
+        const fileId = document.getElementById('deleteFileId').value
+        const entityType = document.getElementById('deleteFileType').value
+
+        if (!fileId) {
+          log('请输入文件ID', 'error')
+          return
+        }
+
+        // 确认删除
+        if (!confirm('确定要删除这个文件吗？此操作不可撤销！')) {
+          return
+        }
+
+        try {
+          // 构建参数数组，如果entityType为空则不传递
+          const params = [fileId]
+          if (entityType) {
+            params.push(entityType)
+          }
+
+          const result = await callEditorApi('project', 'deleteFile', params)
+
+          if (result.success) {
+            log(
+              `文件删除成功！${entityType ? ` (类型: ${entityType})` : ''}`,
+              'success'
+            )
+            document.getElementById('deleteFileId').value = ''
+            document.getElementById('deleteFileType').value = ''
+            // 自动刷新文件列表
+            await listProjectFiles()
+          } else {
+            log(`文件删除失败: ${result.error || '未知错误'}`, 'error')
+          }
+        } catch (error) {
+          log(`删除文件失败: ${error.message}`, 'error')
+        }
+      }
+
+      async function refreshFileList() {
+        await listProjectFiles()
+      }
+
+      // 显示文件列表 - 支持树结构显示
+      function displayFileList(files) {
+        const fileListElement = document.getElementById('fileList')
+        fileListElement.innerHTML = ''
+
+        if (files.length === 0) {
+          fileListElement.innerHTML =
+            '<div style="color: #666;">项目中没有文件</div>'
+          return
+        }
+
+        // 递归显示文件树
+        function renderFileTree(fileList, container, level = 0) {
+          fileList.forEach(file => {
+            const fileEntry = document.createElement('div')
+            fileEntry.style.marginBottom = '5px'
+            fileEntry.style.padding = '5px'
+            fileEntry.style.border = '1px solid #ddd'
+            fileEntry.style.borderRadius = '3px'
+            fileEntry.style.backgroundColor =
+              file.type === 'folder' ? '#f0f8ff' : '#f9f9f9'
+            fileEntry.style.marginLeft = `${level * 20}px` // 缩进显示层级
+
+            const icon = file.type === 'folder' ? '📁' : file.type === 'doc' ? '📄' : '📎'
+            const size = file.size ? ` (${formatFileSize(file.size)})` : ''
+            const modified = file.modified
+              ? ` - ${new Date(file.modified).toLocaleString()}`
+              : ''
+
+            const entityId = file.entityId || file.id
+            const entityType = file.entityType || file.type
+            const idInfo = file.entityId
+              ? `实体ID: ${file.entityId}`
+              : `路径ID: ${file.id}`
+
+            fileEntry.innerHTML = `
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div style="flex: 1; cursor: pointer;" onclick="selectFileForRename('${entityId}', '${file.name}', '${entityType}')">
+                  <span style="margin-right: 5px;">${icon}</span>
+                  <strong>${file.name}</strong>
+                  <span style="color: #666; font-size: 12px;">${file.path}${size}${modified}</span>
+                  <br>
+                  <span style="color: #888; font-size: 11px;">${idInfo} | 类型: ${entityType}</span>
+                </div>
+                <div>
+                  <button onclick="copyToClipboard('${entityId}')" style="font-size: 10px; padding: 2px 6px; margin-left: 5px;">复制ID</button>
+                  <button onclick="selectFileForRename('${entityId}', '${file.name}', '${entityType}')" style="font-size: 10px; padding: 2px 6px; margin-left: 5px; background: #007bff; color: white; border: none; border-radius: 3px;">重命名</button>
+                  <button onclick="selectFileForDelete('${entityId}', '${file.name}', '${entityType}')" style="font-size: 10px; padding: 2px 6px; margin-left: 5px; background: #dc3545; color: white; border: none; border-radius: 3px;">删除</button>
+                </div>
+              </div>
+            `
+
+            container.appendChild(fileEntry)
+
+            // 如果有子文件，递归显示
+            if (file.children && file.children.length > 0) {
+              renderFileTree(file.children, container, level + 1)
+            }
+          })
+        }
+
+        renderFileTree(files, fileListElement)
+      }
+
+      // 格式化文件大小
+      function formatFileSize(bytes) {
+        if (bytes === 0) return '0 B'
+        const k = 1024
+        const sizes = ['B', 'KB', 'MB', 'GB']
+        const i = Math.floor(Math.log(bytes) / Math.log(k))
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+      }
+
+      // 复制到剪贴板
+      function copyToClipboard(text) {
+        navigator.clipboard
+          .writeText(text)
+          .then(() => {
+            log(`已复制到剪贴板: ${text}`, 'success')
+          })
+          .catch(err => {
+            log(`复制失败: ${err.message}`, 'error')
+          })
+      }
+
+      // 选择文件进行重命名
+      function selectFileForRename(fileId, fileName, entityType) {
+        document.getElementById('renameFileId').value = fileId
+        document.getElementById('newFileName').value = fileName
+        document.getElementById('renameFileType').value = entityType
+
+        log(
+          `已选择文件进行重命名: ${fileName} (ID: ${fileId}, 类型: ${entityType})`,
+          'info'
+        )
+
+        // 滚动到重命名区域
+        const renameSection = document.querySelector(
+          'h3:contains("文件重命名")'
+        )
+        if (renameSection) {
+          renameSection.scrollIntoView({ behavior: 'smooth' })
+        }
+      }
+
+      function selectFileForDelete(fileId, fileName, entityType) {
+        document.getElementById('deleteFileId').value = fileId
+        document.getElementById('deleteFileType').value = entityType
+
+        log(
+          `已选择文件进行删除: ${fileName} (ID: ${fileId}, 类型: ${entityType})`,
+          'info'
+        )
+
+        // 滚动到删除区域
+        const deleteSection = document.querySelector(
+          'h3:contains("删除文件")'
+        )
+        if (deleteSection) {
+          deleteSection.scrollIntoView({ behavior: 'smooth' })
+        }
+      }
+
+      // 页面加载完成后的初始化
+      window.addEventListener('load', function () {
+        log('页面加载完成，等待 Overleaf 编辑器加载...', 'info')
+        log('请确保将 iframe src 替换为您的实际 Overleaf 项目 URL', 'info')
+      })
+    </script>
+  </body>
+</html>
